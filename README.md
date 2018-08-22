@@ -1,7 +1,8 @@
 # Velocity, for cryptocurrencies
 spend cryptocurrency inputs in chains to simulate cash velocity
 
-# **DISCLAIMER**: I AM IN NO WAY RESPONSIBLE FOR ANY PAIN/SUFFERING/MISFORTUNE CAUSED BY THE MISUSE OF MY TOOL
+## DISCLAIMER
+**I TAKE NO RESPONSIBILITY FOR ANY PAIN/SUFFERING/MISFORTUNE CAUSED BY THE MISUSE OF MY TOOL**
 
 ## Elevator Pitch
 Velocity is a PHP script written as a tool to test the resiliency of cryptocurrency networks under heavy transaction loads. It connects via RPC to the daemon of choice to gather and spend each unspent input to a single, new address, thereby creating the first *link* in a transaction *chain*. Each *chain* is extended with new *links* as the program continues operation. Inputs are never merged and spent together; each chain remains separate as links are added. Chains are reset as new blocks are found; each new block starts a new round of chains.
