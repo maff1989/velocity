@@ -22,7 +22,7 @@ exit(0);
 class velocity {
 	const MIN_TX_AMOUNT = 0.00001000; // Minimum tx spend amount
 	const MIN_TX_AGE = 25; // Minimum 0-conf tx age in seconds required before spend
-  const VERSION = 0.1;
+	const VERSION = 0.1;
   
 	private $daemon; // JSON-RPC connection to coin daemon
 	private $height; // starting daemon block height
@@ -40,10 +40,10 @@ class velocity {
 	];
 	
 	function __construct(array $config) {
-    // Gather config
+		// Gather config
 		$this->config = $config;
-    // Set version number
-    $this->version = self::VERSION;
+		// Set version number
+		$this->version = self::VERSION;
 		// Connect to daemon
 		$this->daemon = new coindaemon('x', 'x', $this->config['daemon']['host'], $this->config['daemon']['port']);
 		if(!$this->check_daemon()) die ("[error] failed JSON-RPC connection to ".$this->config['daemon']['host'].':'.$this->config['daemon']['port']."\r\n*** reason: ".$this->daemon->error."\r\n");
@@ -142,17 +142,16 @@ class velocity {
 						 *		TRANSACTION CRAFTING
 						 * 
 						 */
-            /*
-            Will be moving to a switch() loop embedded within a while() loop that performs $steps
-						
-            $steps = [
+						/*
+						* Will be moving to a switch() loop embedded within a while() loop that performs $steps
+						$steps = [
 							'getspendable',
 							'getoutputs',
 							'getsignrawtx',
 							'getsignnewrawtx',
 							'sendrawtx'
 						];
-            */
+						*/
 						if($debug) echo " YES\r\n";
 						$spendable = $this->get_spendable($input);
 						if($debug) echo $chain_log_prefix." spendable amount:\t$spendable\r\n";
