@@ -14,6 +14,8 @@ Velocity is a PHP script written as a tool to test the resiliency of cryptocurre
 ## Running velocity
 Assuming all above is already completed and you are at a terminal in the directory in which you've downloaded and modified the `velocity` script per your configuration, run the following command: `./velocity`
 
+Velocity will immediately begin polling your coin daemon via RPC to check for unspent inputs and beging creating transaction chains.
+
 ### What you will see
 * If for any reason the daemon connection fails, you will see an `[error]` stating so. If you see this, please verify your config and rerun Velocity
 * If the connection is successful, the following is an example of what you will see:
@@ -24,10 +26,10 @@ Assuming all above is already completed and you are at a terminal in the directo
 	running since 08/21/2018 22:54:19
 
 [main] round 1: { block:10100  chains:0  links:0  links-confirmed:0 }
-[main] mempool: { total-size:0 bytes  tx-count:0 }
+[main] mempool: { tx-count:0  total-size:0 bytes  ram:0 bytes }
 ```
 
-* `round 1` starts the first set of transaction chains by creating links. As `block`s are found on the network, the rounds increment, and the number of total created `links` (transactions) for the round are then added to the `links-confirmed` stat, which effectively is the total number of transactions that Velocity has sent and had accepted by the network. Transaction `chains` (chains of 0-conf transactions) are emptied after each round because transaction inputs are "fresh" to start brand new chains having received their first confirmation; as an example, some mempool restrictions, e.g. the [25-descendant limit]: https://jasonc.me/blog/chained-0-conf-transactions-memo, are reset for inputs once they are confirmed.
+* `round 1` begins the first set of `chains` by creating `links` that spend transaction inputs. As `block`s are found on the network, the number of rounds passed increases, and the number of total created for the round are then added to the `links-confirmed` stat, which effectively is the total number of transactions that Velocity has sent and had accepted by the network. Chains are emptied after each round because inputs are "fresh" to start brand new chains having received their first confirmation; as an example, some mempool restrictions, e.g. the [25-descendant limit]: https://jasonc.me/blog/chained-0-conf-transactions-memo, are reset for inputs once they are confirmed.
 * `mempool` conveniently displays important stats gauged when stressing a cryptocurrency network: number of unconfirmed transactions in the mempool, aggregate size of unconfirmed transactions in bytes, and total RAM usage by the mempool
 * If any chain runs into error during operation (i.e. receives an error from the RPC daemon) then the chain will be disabled and its tip will not be extended until the next round begins.
 * When a new block is found, the `(!)` indicator will be displayed to the right of the block number for a short period of time
