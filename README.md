@@ -14,6 +14,8 @@ Velocity is a PHP script written as a tool to test the resiliency of cryptocurre
 ## Running velocity
 Assuming all above is already completed and you are at a terminal in the directory in which you've downloaded and modified the `velocity` script per your configuration, run the following command: `./velocity`
 
+* If you receive the error `./velocity: Permission denied` you will need to `chmod +x ./velocity` first before running `./velocity`
+
 Velocity will immediately begin polling your coin daemon via RPC to check for unspent inputs and beging creating transaction chains.
 
 ### What you will see
