@@ -31,8 +31,10 @@ Velocity will immediately begin polling your coin daemon via RPC to check for un
 [main] mempool: { tx-count:0  total-size:0 bytes  ram:0 bytes }
 ```
 
-* `round 1` begins the first set of `chains` by creating `links` that spend transaction inputs. As `block`s are found on the network, the number of rounds passed increases, and the number of total created for the round are then added to the `links-confirmed` stat, which effectively is the total number of transactions that Velocity has sent and had accepted by the network. Chains are emptied after each round because inputs are "fresh" to start brand new chains having received their first confirmation; as an example, some mempool restrictions, e.g. the [25-descendant limit]: https://jasonc.me/blog/chained-0-conf-transactions-memo, are reset for inputs once they are confirmed.
+* `round 1` begins the first set of `chains` by creating `links` that spend transaction inputs. As `block`s are found on the network, the number of rounds passed increases, and the number of total created for the round are then added to the `links-confirmed` stat, which effectively is the total number of transactions that Velocity has sent and had accepted by the network. Chains are emptied after each round because inputs are "fresh" to start brand new chains having received their first confirmation; as an example, some mempool restrictions, e.g. the [25-descendant limit][1], are reset for inputs once they are confirmed.
 * `mempool` conveniently displays important stats gauged when stressing a cryptocurrency network: number of unconfirmed transactions in the mempool, aggregate size of unconfirmed transactions in bytes, and total RAM usage by the mempool
 * If any chain runs into error during operation (i.e. receives an error from the RPC daemon) then the chain will be disabled and its tip will not be extended until the next round begins.
 * When a new block is found, the `(!)` indicator will be displayed to the right of the block number for a short period of time
 * If the average block time for the coin passes and a block hasn't been found, the `(?)` indicator will be displayed to the right of the block number
+
+[1]: https://jasonc.me/blog/chained-0-conf-transactions-memo
