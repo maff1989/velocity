@@ -1,0 +1,659 @@
+#!/usr/bin/php
+<?php
+/**
+ *	CONFIGURATION
+ */
+$config['daemon'] = ['host' => '127.0.0.1', 'port' => '8332']; // RPC for Bitcoin daemon
+$config['block_time'] = 600; // the daemon's block time in seconds
+$config['min_sat_byte'] = 1; // minimum number of satoshis per byte to pay for transaction fees
+$config['debug'] = false; // enable/disable extra debugging info
+$config['add_op_return'] = true; // enable/disable random OP_RETURN data in txs to increase size by 80 ASCII bytes
+/**
+ * 
+ *			DO NOT EDIT ANYTHING BELOW UNLESS YOU KNOW WHAT YOU ARE DOING
+ * 
+ */
+$v = new velocity($config);
+while(true) {
+	$v->init();
+}
+exit(0);
+
+class velocity {
+	const MIN_TX_AMOUNT = 0.00001000; // Minimum tx spend amount
+	const MIN_TX_AGE = 25; // Minimum 0-conf tx age in seconds required before spend
+  const VERSION = 0.1;
+  
+	private $daemon; // JSON-RPC connection to coin daemon
+	private $height; // starting daemon block height
+	private $height_time = 0; // time we received latest daemon height
+	private $unspent = []; // our wallet's unspent inputs (0+ confirmations)
+	private $mempool = []; // numerical array of our daemon's mempool txids
+	private $chains = []; // numerical array of transaction chains
+	private $stats = [ // runtime stats counters
+		'block' => 0, // current daemon height
+		'blocks-seen' => 0, // blocks seen since start
+		'chains' => 0, // num active chains (i.e. [...|input]->[output|input]->[output|...])
+		'chains-inactive' => 0, // num chains w/ error and marked inactive
+		'links' => 0,
+		'links-confirmed' => 0
+	];
+	
+	function __construct(array $config) {
+    // Gather config
+		$this->config = $config;
+    // Set version number
+    $this->version = self::VERSION;
+		// Connect to daemon
+		$this->daemon = new coindaemon('x', 'x', $this->config['daemon']['host'], $this->config['daemon']['port']);
+		if(!$this->check_daemon()) die ("[error] failed JSON-RPC connection to ".$this->config['daemon']['host'].':'.$this->config['daemon']['port']."\r\n*** reason: ".$this->daemon->error."\r\n");
+		
+		// initial property values
+		$this->height = $this->daemon->getblockcount();
+    
+	}
+	
+	function init() {
+		$debug = $this->config['debug'];
+		$start_time = time();
+		// Run until CTRL+C or other stop signal
+		while(true) {
+			system('clear');
+			echo "\r\n";
+			echo "\tVelocity, for cryptocurrencies (".$this->version.")\r\n";
+			echo "\trunning since ".date('m/d/Y H:i:s', $start_time)."\r\n";
+			echo "\r\n";
+			
+			// Verify daemon connection
+			if(!$this->check_daemon()) die("[error] connection to ".$this->config['daemon']['host'].':'.$this->config['daemon']['port']." failed\r\n");
+			
+			// Update block height
+			$this->prev_height = $this->height;
+			$this->height = $this->daemon->getblockcount();
+			
+			// If we have received a new block, reset our chains array
+			if($this->height > $this->prev_height) {
+				// Set current time of block height
+				$this->height_time = time();
+				// Increment blocks seen stat
+				$this->stats['blocks-seen'] += 1;
+				// Add prev links to confirmed count
+				$this->stats['links-confirmed'] += $this->stats['links'];
+				// Reset all chains after new block; start with fresh tx chains
+				$this->chains = [];
+				
+			}
+			
+			// Update mempool info
+			$this->mempool = $this->daemon->getmempoolinfo();
+			
+			/**
+			 *		CONSOLE STATUS UPDATE
+			 */
+			// Update all chain statistics
+			$this->update_runtime_stats();
+			echo '[main] round '.($this->stats['blocks-seen'] + 1).': { block:'.$this->stats['block'].$this->show_block_time_indicator().'  chains:'.number_format($this->stats['chains']).'  links:'.number_format($this->stats['links']).'  links-confirmed:'.number_format($this->stats['links-confirmed'])." }\r\n";
+			echo '[main] mempool: { tx-count:'.$this->mempool['size'].'  total-size:'.number_format($this->mempool['bytes']).' bytes  ram:'.number_format($this->mempool['usage'])." bytes }\r\n";
+			
+			if($this->stats['chains-inactive'] > 0) echo "\r\n*** ".$this->stats['chains-inactive']." chains are inactive due to error\r\n";
+			
+			// Iterate through non-empty inputs array after 1-second wait
+			sleep(1);
+			/**
+			 *		BEGIN INPUTS ITERATION
+			 * 
+			 */
+			// Get current inputs (0+ conf)
+			$inputs = $this->get_unspent_inputs();
+			if(!empty($inputs)) {
+				for($i = 0; $i < count($inputs); $i++) {
+					/**
+					 *		CHECK INPUTS
+					 * 
+					 */
+					$input = $inputs[$i];
+					// If this input has not yet been chained, we start a new chain
+					if($debug) echo "[debug] checking if input ".($i + 1)." is chained...";
+					if(($chain_index = $this->is_chained_input($input)) === false) {
+						if($debug) echo " NO; initializing new chain\r\n";
+						// put new chain on front of chains array; chain index is 0
+						array_unshift($this->chains, $this->new_chain($input));
+						$chain_index = 0;
+					} else if($debug) echo " YES; initializing existing chain\r\n";
+					
+					// Set the chain var as current chain index
+					$chain = $this->chains[$chain_index];
+					$num_chains = count($this->chains);
+					$chain_log_prefix = "[debug] [chain ".($chain_index + 1)."/$num_chains]";
+					
+					// If the chain has been marked inactive, continue to next chain
+					if($debug) echo $chain_log_prefix." checking if chain is active...";
+					if(!$chain['state']['active']) {
+						if($debug) echo " NO; continuing to next chain...\r\n";
+						continue;
+					} else if($debug) echo " YES\r\n";
+					$chain['state']['active'] = true;
+					
+					// Only proceed if input is also ready to spend
+					if($debug) echo $chain_log_prefix." checking if chain tip is ready to spend...";
+					if($this->is_input_ready($chain['tip'])) {
+						
+						/**
+						 *		TRANSACTION CRAFTING
+						 * 
+						 */
+            /*
+            Will be moving to a switch() loop embedded within a while() loop that performs $steps
+						
+            $steps = [
+							'getspendable',
+							'getoutputs',
+							'getsignrawtx',
+							'getsignnewrawtx',
+							'sendrawtx'
+						];
+            */
+						if($debug) echo " YES\r\n";
+						$spendable = $this->get_spendable($input);
+						if($debug) echo $chain_log_prefix." spendable amount:\t$spendable\r\n";
+						
+						// Set up outputs to distribute coin(s)
+						if($debug) echo $chain_log_prefix." preparing outputs...";
+						$outputs = [$this->daemon->getnewaddress() => $spendable];
+						if($debug) echo " OK\r\n";
+						
+						if($this->config['add_op_return']) {
+							if($debug) echo $chain_log_prefix." adding random OP_RETURN data to tx output...";
+							$outputs['data'] = gen_tx_data();
+							if($debug) echo " OK\r\n";
+						}
+						
+						// If this input is from an unconfirmed tx, we must reference its parent
+						$prevtxs = [];
+						if($this->is_unconfirmed_input($i)) {
+							if($debug) echo $chain_log_prefix." spending unconfirmed tx; preparing prevtxs array...";
+							$prevtxs[] = $this->get_prevtx($input, $i);
+							if($debug) echo " OK\r\n";
+						} else if($debug) echo $chain_log_prefix." spending confirmed tx; continuing...\r\n";
+						
+						// Create + sign new tx with above inputs/outputs
+						if($debug) echo $chain_log_prefix." signing initial tx...";
+						if(!$signed_tx = $this->daemon->signrawtransaction(
+							$raw_tx = $this->daemon->createrawtransaction([$input], $outputs), $prevtxs
+						)) { die($debug ? " FAIL\r\n": "[error] first createrawtransaction RPC call failed\r\n".' *** reason:'.$this->daemon->error."\r\n *** raw_tx:".json_encode($raw_tx)."\r\n"); }
+						else { if($debug) echo " OK\r\n"; }
+						
+						// Adjust fee on signed tx and create new signed tx
+						if($debug) echo $chain_log_prefix." signing new tx with fee adjustment...";
+						if(!$signed_tx = $this->daemon->signrawtransaction(
+							$this->adjust_for_fee($signed_tx, [$input], $outputs), $prevtxs
+						)) { die($debug ? " FAIL\r\n": "[error] second createrawtransaction RPC call failed\r\n".' *** reason:'.$this->daemon->error."\r\n *** raw_tx:".json_encode($raw_tx)."\r\n"); }
+						else { if($debug) echo " OK\r\n"; }
+						
+						/**
+						 *		SEND THE TX :)
+						 * 
+						 */
+						if($debug) echo $chain_log_prefix." sending tx...";
+						$txid = $this->daemon->sendrawtransaction($signed_tx['hex']);
+						if($txid) {
+							if($debug) echo " OK\r\n";
+							if($debug) echo $chain_log_prefix."\t$txid\r\n";
+						}
+						else {
+							if($debug) echo "FAIL\r\n[error] ".$this->daemon->error."\r\n";
+							else echo "[error] ".$chain_log_prefix." ".$this->daemon->error."\r\n";
+						}
+						
+						/**
+						 *		ERROR HANDLING
+						 * 
+						 */
+						$error = false;
+						if($e = $this->daemon->error) {
+							// Since input wasn't spent, we leave chain tip as-is and
+							// only update the state accordingly
+							$chain['error']['string'] = $e;
+							$chain['error']['height'] = $this->height;
+							$chain['state']['active'] = false;
+							// $chain['state']['ready'] = false;
+							
+							// Update chains array with latest chain data
+							$this->chains[$chain_index] = $chain;
+							
+							// Houston, we have a spending error
+							$error = true;
+						}
+						
+						/**
+						 *		CLEANUP
+						 * 
+						 */
+						// Update chain info if we haven't received a spending error
+						if(!$error) {
+							// Move the spent input to the links array
+							array_unshift($chain['links'], $chain['tip']);
+							// Update chain tip with latest input
+							$chain['tip'] = [
+								'txid' => "$txid:0", // always set first output since only 1 rcpt
+								'time' => time(),
+								'input_used' => [
+									'txid' => $input['txid'],
+									'vout' => $input['vout']
+								]
+							];
+							
+							// Update chains array with latest chain data
+							$this->chains[$chain_index] = $chain;
+						}
+						
+						// Continue the inputs loop after a random wait
+						if($debug) echo $chain_log_prefix." done!\r\n";
+						usleep(mt_rand(650000,1150000));
+						continue;
+					} else if($debug) echo " NO; continuing...\r\n";
+				}
+			} else if($debug) echo "[main] no inputs to spend...\r\n";
+		}
+	}
+	/**
+	 * check_daemon(): Checks to ensure connectivity to daemon is OK
+	 * 
+	 * return (bool): True if daemon is alive, false otherwise
+	 */
+	function check_daemon() {
+		// Do a simple getblockcount() to ensure daemon responds
+		return (bool) $this->daemon->getblockcount();
+	}
+	
+	function update_runtime_stats() {
+		$this->stats['block'] = $this->height;
+		$this->stats['unspent'] = count($this->unspent);
+		
+		$states = $this->get_all_chain_states();
+		$this->stats['chains'] = $states['active'];
+		$this->stats['chains-inactive'] = $states['inactive'];
+		
+		$this->stats['links'] = ($links = $this->get_link_count());
+	}
+	/**
+	 * new_chain(): Create new chain array with the provided input $txid:$vout
+	 * 
+	 * @param (array) $input: the 'txid' and 'vout' of the input for which to create the new chain
+	 * 
+	 * return (array):new chain's "genesis" link
+	 */
+	function new_chain(array $input) {
+		return [
+			'tip' => [
+				'txid' => $input['txid'].':'.$input['vout'],
+				'time' => time() - (self::MIN_TX_AGE + 1),
+				'genesis' => true
+			],
+			'links' => [],
+			'state' => ['active' => true],
+			'error' => [
+				'string' => '',
+				'height' => 0
+			]
+		];
+	}
+	/**
+	 * is_chain_error(): Checks the chain state at given index to ensure it is ready to be extended
+	 * 
+	 * return (bool): true is returned if the chain has an error, false otherwise
+	 */
+	function is_chain_error(array $chain) {
+		// Set up handlers to modify chain state as needed
+		switch(!false) {
+			// chain is ready if already set or if chain tip is genesis
+			case isset($chain['tip']['genesis']):
+				return false;
+			
+			// 25-descendant limit on unconfirmed tx
+			case strpos($chain['error']['string'], 'too-long-mempool-chain'):
+				// reset chain state if new block has been found
+				if($this->height > $chain['error']['height'])
+					return false;
+					
+			// Assume chain is in error (and should be deactivated) if no above handler matched
+			default:
+				return true;
+		}
+	}
+	
+	function show_block_time_indicator() {
+		if($this->height_time == 0) return '';
+		elseif(time() - $this->height_time < (0.05 * $this->config['block_time'])) return '(!)'; // new/recent block!
+		elseif(time() - $this->height_time > $this->config['block_time']) return '(?)'; // where is the next block?
+		
+		// If not matched, return empty string
+		return '';
+	}
+	
+	function get_all_chain_states() {
+		$active = 0;
+		$inactive = 0;
+		for($i = 0; $i < count($this->chains); $i++) {
+			$this->chains[$i]['state']['active'] ? $active += 1: $inactive += 1;
+		}
+		
+		return ['active' => $active, 'inactive' => $inactive];
+	}
+	
+	function get_link_count() {
+		$num_links = 0;
+		for($i = 0; $i < count($this->chains); $i++) {
+			$num_links += count($this->chains[$i]['links']);
+		}
+		
+		return $num_links;
+	}
+	
+	function get_prevtx(array $input, $index = 0) {
+		// decode the utxo
+		$decoded_input = $this->daemon->decoderawtransaction(
+			$this->daemon->getrawtransaction($input['txid'])
+		);
+		// for each output in current utxo...
+		for($i = 0; $i < count($decoded_input['vout']); $i++) {
+			$vout = $decoded_input['vout'][$i];
+			// loop through unspent at $index
+			for($j = $index; $j < count($this->unspent); $j++) {
+				if(
+					$this->unspent[$index]['amount'] == $vout['value'] &&
+					$this->unspent[$index]['vout'] == $vout['n']
+				) {
+					return [
+						'txid' => $this->unspent[$index]['txid'],
+						'vout' => $this->unspent[$index]['vout'],
+						'scriptPubKey' => $this->unspent[$index]['scriptPubKey'],
+						'amount' => (float) $this->unspent[$index]['amount']
+					];
+				}
+				
+			}
+			
+		}
+	}
+	
+	function is_chained_input(array $input) {
+		// For each chain
+		for($i = 0; $i < count($this->chains); $i++) {
+			$chain = $this->chains[$i];
+			// Check chain's most recent txid first
+			if($chain['tip']['txid'] == $input['txid'].':'.$input['vout']) return $i;
+			// Then check chain's history
+			for($j = 0; $j < count($chain['links']); $j++) {
+				$spent = $chain['links'][$j];
+				// Match txid
+				if($spent['txid'] == $input['txid'].':'.$input['vout']) return $i;
+			}
+		}
+		// input not chained
+		return false;
+	}
+	/**
+	 * True if input has less than 1 network confirmation
+	 */
+	function is_unconfirmed_input(int $index) {
+		return (bool) ($this->unspent[$index]['confirmations'] < 1);
+	}
+	/**
+	 * is_input_ready(): Checks to determine where the tip of a particular chain is ready to spend
+	 * 
+	 * @param (array) $chain_tip: array containing all chain tip info (txid:vout, time, prevtxs, etc)
+	 * 
+	 * return (bool): True if chain tip is ready to spend, false otherwise
+	 */
+	function is_input_ready(array $chain_tip) {
+		
+		$ready = false;
+		// Input is ready if it is of the minimum age for newly-created inputs
+		$ready = (bool) (time() > ($chain_tip['time'] + self::MIN_TX_AGE));
+		
+		return $ready;
+	}
+	/**
+	 * Returns inputs in [{"txid":"abcdef012...":"vout":n},{...}] structure
+	 */
+	function get_unspent_inputs() {
+		// Verify daemon connection
+		if(!$this->check_daemon()) die("[error] failed to connect to daemon; exiting...\r\n");
+		
+		// Get unspent inputs
+		$this->unspent = $this->daemon->listunspent($minconf = 0);
+		
+		$inputs = [];
+		for($i = 0; $i < count($this->unspent); $i++) {
+			$inputs[$i] = [
+				'txid' => $this->unspent[$i]['txid'],
+				'vout' => $this->unspent[$i]['vout']
+			];
+		}
+		
+		return $inputs;
+	}
+	
+	function adjust_for_fee($signed_tx, array $inputs, array $outputs) {
+		$decoded_tx = $this->daemon->decoderawtransaction($signed_tx['hex']);
+		$last_output = array_shift($decoded_tx['vout']);
+		// Update the output address amount to exclude fee in bytes
+		$outputs[$last_output['scriptPubKey']['addresses'][0]] = (float) ($last_output['value'] - number_format(($decoded_tx['size'] / 100000000) * $this->config['min_sat_byte'], 8));
+		
+		return $this->daemon->createrawtransaction($inputs, $outputs);
+	}
+	/**
+	 * get_spendable(): Gets total spendable amount of specific vout in input
+	 * 
+	 * @param (array) $input: input txid/vout array
+	 * 
+	 * return (float): returns the input's vout value
+	 */
+	function get_spendable(array $input) {
+		$decoded_tx = $this->daemon->decoderawtransaction(
+			$this->daemon->getrawtransaction($input['txid'])
+		);
+		
+		return (float) $decoded_tx['vout'][$input['vout']]['value'];
+		
+	}
+	/**
+	 * rand_wait(): Block loop iterations for a random amount of time
+	 */
+	function rand_wait() {
+		usleep(mt_rand(350000, 635000));
+	}
+	
+}
+/*
+EasyBitcoin-PHP
+A simple class for making calls to Bitcoin's API using PHP.
+https://github.com/aceat64/EasyBitcoin-PHP
+====================
+The MIT License (MIT)
+Copyright (c) 2013 Andrew LeCody
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+====================
+// Initialize Bitcoin connection/object
+$bitcoin = new Bitcoin('username','password');
+// Optionally, you can specify a host and port.
+$bitcoin = new Bitcoin('username','password','host','port');
+// Defaults are:
+//	host = localhost
+//	port = 8332
+//	proto = http
+// If you wish to make an SSL connection you can set an optional CA certificate or leave blank
+// This will set the protocol to HTTPS and some CURL flags
+$bitcoin->setSSL('/full/path/to/mycertificate.cert');
+// Make calls to bitcoind as methods for your object. Responses are returned as an array.
+// Examples:
+$bitcoin->getinfo();
+$bitcoin->getrawtransaction('0e3e2357e806b6cdb1f70b54c3a3a17b6714ee1f0e68bebb44a74b1efd512098',1);
+$bitcoin->getblock('000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f');
+// The full response (not usually needed) is stored in $this->response
+// while the raw JSON is stored in $this->raw_response
+// When a call fails for any reason, it will return FALSE and put the error message in $this->error
+// Example:
+echo $bitcoin->error;
+// The HTTP status code can be found in $this->status and will either be a valid HTTP status code
+// or will be 0 if cURL was unable to connect.
+// Example:
+echo $bitcoin->status;
+*/
+//class Bitcoin
+class coindaemon
+{
+    // Configuration options
+    private $username;
+    private $password;
+    private $proto;
+    private $host;
+    private $port;
+    private $url;
+    private $CACertificate;
+    // Information and debugging
+    public $status;
+    public $error;
+    public $raw_response;
+    public $response;
+    private $id = 0;
+    /**
+     * @param string $username
+     * @param string $password
+     * @param string $host
+     * @param int $port
+     * @param string $proto
+     * @param string $url
+     */
+    public function __construct($username, $password, $host = 'localhost', $port = 8332, $url = null)
+    {
+        $this->username      = $username;
+        $this->password      = $password;
+        $this->host          = $host;
+        $this->port          = $port;
+        $this->url           = $url;
+        // Set some defaults
+        $this->proto         = 'http';
+        $this->CACertificate = null;
+    }
+    /**
+     * @param string|null $certificate
+     */
+    public function setSSL($certificate = null)
+    {
+        $this->proto         = 'https'; // force HTTPS
+        $this->CACertificate = $certificate;
+    }
+    public function __call($method, $params)
+    {
+        $this->status       = null;
+        $this->error        = null;
+        $this->raw_response = null;
+        $this->response     = null;
+        // If no parameters are passed, this will be an empty array
+        $params = array_values($params);
+        // The ID should be unique for each call
+        $this->id++;
+        // Build the request, it's ok that params might have any empty array
+        $request = json_encode(array(
+            'method' => $method,
+            'params' => $params,
+            'id'     => $this->id
+        ));
+        // Build the cURL session
+        $curl    = curl_init("{$this->proto}://{$this->host}:{$this->port}/{$this->url}");
+        $options = array(
+            CURLOPT_HTTPAUTH       => CURLAUTH_BASIC,
+            CURLOPT_USERPWD        => $this->username . ':' . $this->password,
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_FOLLOWLOCATION => true,
+            CURLOPT_MAXREDIRS      => 10,
+            CURLOPT_HTTPHEADER     => array('Content-type: application/json'),
+            CURLOPT_POST           => true,
+            CURLOPT_POSTFIELDS     => $request
+        );
+        // This prevents users from getting the following warning when open_basedir is set:
+        // Warning: curl_setopt() [function.curl-setopt]:
+        //   CURLOPT_FOLLOWLOCATION cannot be activated when in safe_mode or an open_basedir is set
+        if (ini_get('open_basedir')) {
+            unset($options[CURLOPT_FOLLOWLOCATION]);
+        }
+        if ($this->proto == 'https') {
+            // If the CA Certificate was specified we change CURL to look for it
+            if (!empty($this->CACertificate)) {
+                $options[CURLOPT_CAINFO] = $this->CACertificate;
+                $options[CURLOPT_CAPATH] = DIRNAME($this->CACertificate);
+            } else {
+                // If not we need to assume the SSL cannot be verified
+                // so we set this flag to FALSE to allow the connection
+                $options[CURLOPT_SSL_VERIFYPEER] = false;
+            }
+        }
+        curl_setopt_array($curl, $options);
+        // Execute the request and decode to an array
+        $this->raw_response = curl_exec($curl);
+        $this->response     = json_decode($this->raw_response, true);
+        // If the status is not 200, something is wrong
+        $this->status = curl_getinfo($curl, CURLINFO_HTTP_CODE);
+        // If there was no error, this will be an empty string
+        $curl_error = curl_error($curl);
+        curl_close($curl);
+        if (!empty($curl_error)) {
+            $this->error = $curl_error;
+        }
+        if ($this->response['error']) {
+            // If bitcoind returned an error, put that in $this->error
+            $this->error = $this->response['error']['message'];
+        } elseif ($this->status != 200) {
+            // If bitcoind didn't return a nice error message, we need to make our own
+            switch ($this->status) {
+                case 400:
+                    $this->error = 'HTTP_BAD_REQUEST';
+                    break;
+                case 401:
+                    $this->error = 'HTTP_UNAUTHORIZED';
+                    break;
+                case 403:
+                    $this->error = 'HTTP_FORBIDDEN';
+                    break;
+                case 404:
+                    $this->error = 'HTTP_NOT_FOUND';
+                    break;
+            }
+        }
+        if ($this->error) {
+            return false;
+        }
+        return $this->response['result'];
+    }
+}
+
+// Misc functions
+function gen_tx_data() {
+	$strlen = 80; // this is max w/o node reject
+	$charset = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789./';
+	
+	$string = '';
+	for($i = 0; $i < $strlen; $i++) {
+		$string .= $charset[mt_rand(0, strlen($charset) - 1)];
+	}
+	// tx data must be hex!
+	return bin2hex($string);
+}
+
+?>
