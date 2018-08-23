@@ -4,7 +4,7 @@ spend cryptocurrency inputs in chains to simulate cash velocity
 ## DISCLAIMER
 **I TAKE NO RESPONSIBILITY FOR ANY PAIN/SUFFERING/MISFORTUNE CAUSED BY THE MISUSE OF MY TOOL**
 
-**THIS TOOL DOES NOT WORK WITH ETHEREUM; ONLY BITCOIN DERIVATIVES SUCH AS BITCOIN CASH, LITECOIN, DASH, ZCASH, DIGIBYTE, SMARTCASH, ZCOIN, ETC.  ENVDEAVORS TO RUN THIS SCRIPT AS-IS WITH ETH/ETC/ELLA/ETC. WILL END BADLY**
+**THIS TOOL DOES NOT WORK WITH ETHEREUM; ONLY BITCOIN DERIVATIVES SUCH AS BITCOIN CASH, LITECOIN, DASH, ZCASH, DIGIBYTE, SMARTCASH, ZCOIN, ETC. (i.e. anything forked from a recent Bitcoin Core codebase). ENVDEAVORS TO RUN THIS SCRIPT AS-IS ON ETH/ETC/ELLA/ETC. NETWORKS WILL LIKELY END IN DISASTER**
 
 ## Elevator Pitch
 Velocity is a PHP script written as a tool to test the resiliency of cryptocurrency networks under heavy transaction loads. It connects via RPC to the daemon of choice to gather and spend each unspent input to a single, new address, thereby creating the first *link* in a transaction *chain*. Each chain is extended with new links as the program continues operation. Inputs are never merged, or spent together; each chain remains independent from one another as links are added to them. Chains are discarded as new blocks are found; each new block starts a new round of chains.
