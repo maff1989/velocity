@@ -4,10 +4,10 @@ spend cryptocurrency inputs in chains to simulate cash velocity
 ## DISCLAIMER
 **I TAKE NO RESPONSIBILITY FOR ANY PAIN/SUFFERING/MISFORTUNE CAUSED BY THE MISUSE OF MY TOOL**
 
-**THIS TOOL DOES NOT WORK WITH ETHEREUM; ONLY BITCOIN DERIVATIVES SUCH AS BITCOIN CASH, LITECOIN, DASH, ZCASH, DIGIBYTE, SMARTCASH, ZCOIN, ETC. (i.e. anything forked from a recent Bitcoin Core codebase). ENDEAVORS TO RUN THIS SCRIPT AS-IS ON ETH/ETC/ELLA/ETC. NETWORKS WILL LIKELY END IN DISASTER**
+**THIS TOOL DOES NOT WORK WITH ETHEREUM; ONLY BITCOIN DERIVATIVES SUCH AS BITCOIN CASH, LITECOIN, DASH, ZCASH, DIGIBYTE, SMARTCASH, ZCOIN, ETC. (i.e. anything forked from a recent Bitcoin Core codebase supported by [EasyBitcoin-PHP][1]). ENDEAVORS TO RUN THIS SCRIPT AS-IS ON ETH/ETC/ELLA/ETC. NETWORKS WILL LIKELY END IN DISASTER**
 
 ## Elevator Pitch
-Velocity is a PHP script written as a tool to test the resiliency of cryptocurrency networks under heavy transaction loads. It connects via RPC to the daemon of choice to gather and spend each unspent input to a single, new address, thereby creating the first *link* in a transaction *chain*. Each chain is extended with new links as the program continues operation. Inputs are never merged, or spent together; each chain remains independent from one another as links are added to them. Chains are discarded as new blocks are found; each new block starts a new round of chains.
+Velocity is a PHP script written as a tool to test the resiliency of cryptocurrency networks under heavy transaction loads. It connects via RPC to the daemon of choice to gather and spend each unspent input to a single, new address, thereby creating the first *link* in a transaction *chain*. Each chain is extended with new links as the program continues operation. Inputs are never merged, or spent together; each chain remains independent from one another as links are added to them. Chains are discarded as new blocks are found; each new block starts a new round where new chains are built from links of fresh, confirmed inputs.
 
 ## Setup
 1. As of v0.1, Velocity requires an RPC connection to a *fully-validating daemon* (with a `host:port`) to function. This may change in the future as the project matures. Refer to the developer's website of any particular coin if you wish to run their fully-validating daemon with Velocity.
@@ -39,7 +39,7 @@ Velocity will immediately begin polling your coin daemon via RPC to check for un
 ```
 
 * `round 1` begins the first set of `chains` by creating `links` that spend transaction inputs. As `block`s are found on the network, Velocity moves to the next round, and the number of total links (out of all chains) created for the round are then added to the `links-confirmed` stat (this stat, effectively, is the total number of transactions that Velocity has sent to, and had accepted by, the network).
-* Chains are emptied after each round because inputs are "fresh" to start brand new chains having received their first confirmation; as an example, some mempool restrictions, e.g. the [25-descendant limit][1], are reset for inputs once they are confirmed.
+* Chains are emptied after each round because inputs are "fresh" to start brand new chains having received their first confirmation; as an example, some mempool restrictions, e.g. the [25-descendant limit][2], are reset for inputs once they are confirmed.
 * `mempool` conveniently displays important stats gauged when stressing a cryptocurrency network: number of unconfirmed transactions in the mempool, aggregate size of unconfirmed transactions in bytes, and total RAM usage by the mempool
 * If any chain runs into error during operation (i.e. receives an error from the RPC daemon) then the chain will be disabled and its tip will not be extended until the next round begins.
 * When a new block is found, the `(!)` indicator will be displayed to the right of the block number for a short period of time (currently 5% of the avg block time; for BTC/BCH this is 30s)
@@ -48,4 +48,5 @@ Velocity will immediately begin polling your coin daemon via RPC to check for un
 ## Stopping Velocity
 If you wish to shut down Velocity, all you need to do is close the terminal window in which it is running, or send a SIGINT signal (i.e. `CTRL+C`) to the process.
 
-[1]: https://jasonc.me/blog/chained-0-conf-transactions-memo
+[1]: https://github.com/aceat64/EasyBitcoin-PHP
+[2]: https://jasonc.me/blog/chained-0-conf-transactions-memo
