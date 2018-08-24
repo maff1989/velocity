@@ -24,7 +24,7 @@ exit(0);
 class velocity {
 	const MIN_TX_AMOUNT = 0.00001000; // Minimum tx spend amount
 	const MIN_TX_AGE = 25; // Minimum 0-conf tx age in seconds required before spend
-	const VERSION = 0.1.1;
+	const VERSION = '0.1.1';
   
 	private $daemon; // JSON-RPC connection to coin daemon
 	private $height; // starting daemon block height
