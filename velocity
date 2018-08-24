@@ -4,6 +4,8 @@
  *	CONFIGURATION
  */
 $config['daemon'] = ['host' => '127.0.0.1', 'port' => '8332']; // RPC for Bitcoin daemon
+$config['daemon']['user'] = 'x'; // rpcuser
+$config['daemon']['pass'] = 'x'; // rpcpassword
 $config['block_time'] = 600; // the daemon's block time in seconds
 $config['min_sat_byte'] = 1; // minimum number of satoshis per byte to pay for transaction fees
 $config['debug'] = false; // enable/disable extra debugging info
@@ -22,7 +24,7 @@ exit(0);
 class velocity {
 	const MIN_TX_AMOUNT = 0.00001000; // Minimum tx spend amount
 	const MIN_TX_AGE = 25; // Minimum 0-conf tx age in seconds required before spend
-	const VERSION = 0.1;
+	const VERSION = 0.1.1;
   
 	private $daemon; // JSON-RPC connection to coin daemon
 	private $height; // starting daemon block height
@@ -45,7 +47,7 @@ class velocity {
 		// Set version number
 		$this->version = self::VERSION;
 		// Connect to daemon
-		$this->daemon = new coindaemon('x', 'x', $this->config['daemon']['host'], $this->config['daemon']['port']);
+		$this->daemon = new coindaemon($this->config['daemon']['user'], $this->config['daemon']['pass'], $this->config['daemon']['host'], $this->config['daemon']['port']);
 		if(!$this->check_daemon()) die ("[error] failed JSON-RPC connection to ".$this->config['daemon']['host'].':'.$this->config['daemon']['port']."\r\n*** reason: ".$this->daemon->error."\r\n");
 		
 		// initial property values
