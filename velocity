@@ -1,5 +1,6 @@
 #!/usr/bin/php
 <?php
+
 /**
  *	CONFIGURATION
  */
@@ -10,11 +11,17 @@ $config['block_time'] = 600; // the daemon's block time in seconds
 $config['min_sat_byte'] = 1; // minimum number of satoshis per byte to pay for transaction fees
 $config['debug'] = false; // enable/disable extra debugging info
 $config['add_op_return'] = true; // enable/disable random OP_RETURN data in txs to increase size by 80 ASCII bytes
+
+
+// =-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=
+
 /**
  * 
  *			DO NOT EDIT ANYTHING BELOW UNLESS YOU KNOW WHAT YOU ARE DOING
  * 
  */
+ 
+
 $v = new velocity($config);
 while(true) {
 	$v->init();
@@ -24,8 +31,12 @@ exit(0);
 class velocity {
 	const MIN_TX_AMOUNT = 0.00001000; // Minimum tx spend amount
 	const MIN_TX_AGE = 25; // Minimum 0-conf tx age in seconds required before spend
-	const VERSION = '0.1.1';
-  
+	const VERSION = '0.2'; // optimized tx crafting logic
+	// for tx calculations
+	// Not using this because we aren't splitting the output amount between addresses
+	// const TX_SPLIT_SWAY = 0.05; // 5% sway
+	
+	// Common properties
 	private $daemon; // JSON-RPC connection to coin daemon
 	private $height; // starting daemon block height
 	private $height_time = 0; // time we received latest daemon height
@@ -37,12 +48,16 @@ class velocity {
 		'blocks-seen' => 0, // blocks seen since start
 		'chains' => 0, // num active chains (i.e. [...|input]->[output|input]->[output|...])
 		'chains-inactive' => 0, // num chains w/ error and marked inactive
-		'links' => 0,
-		'links-confirmed' => 0
+		'links' => 0, // number of links created during current round
+		'links-confirmed' => 0 // total number of links confirmed by network
 	];
-	
+	/**
+	 * __construct(): Initiate the Velocity instance by applying user config and testing daemon RPC connection. Also set some properties
+	 * 
+	 * param (array) $config: User-defined config array
+	 * 
+	 */
 	function __construct(array $config) {
-		// Gather config
 		$this->config = $config;
 		// Set version number
 		$this->version = self::VERSION;
@@ -52,28 +67,36 @@ class velocity {
 		
 		// initial property values
 		$this->height = $this->daemon->getblockcount();
-    
+		// Debug mode?
+		$this->debug = $this->config['debug'];
 	}
-	
+	/**
+	 * init(): Primary runtime function; executes the Velocity server
+	 * 
+	 * CTRL+C from the terminal anytime to stop the Velocity server
+	 */
 	function init() {
-		$debug = $this->config['debug'];
+		
 		$start_time = time();
 		// Run until CTRL+C or other stop signal
 		while(true) {
 			system('clear');
 			echo "\r\n";
-			echo "\tVelocity, for cryptocurrencies (v".$this->version.")\r\n";
+			echo "\tVelocity, for cryptocurrencies (".$this->version.")\r\n";
 			echo "\trunning since ".date('m/d/Y H:i:s', $start_time)."\r\n";
 			echo "\r\n";
 			
-			// Verify daemon connection
-			if(!$this->check_daemon()) die("[error] connection to ".$this->config['daemon']['host'].':'.$this->config['daemon']['port']." failed\r\n");
+			// Verify daemon connection before proceeding with loop iteration
+			if(!$this->check_daemon()) die("[error] JSON-RPC connection to ".$this->config['daemon']['host'].':'.$this->config['daemon']['port']." was lost.\r\n*** reason: ".$this->daemon->error."\r\n");
 			
 			// Update block height
 			$this->prev_height = $this->height;
 			$this->height = $this->daemon->getblockcount();
 			
-			// If we have received a new block, reset our chains array
+			/**
+			 *		NEW BLOCK HANDLER
+			 * 
+			 */
 			if($this->height > $this->prev_height) {
 				// Set current time of block height
 				$this->height_time = time();
@@ -86,26 +109,27 @@ class velocity {
 				
 			}
 			
-			// Update mempool info
+			// Gather some updates for the console
 			$this->mempool = $this->daemon->getmempoolinfo();
+			$this->update_runtime_stats();
 			
 			/**
 			 *		CONSOLE STATUS UPDATE
 			 */
-			// Update all chain statistics
-			$this->update_runtime_stats();
 			echo '[main] round '.($this->stats['blocks-seen'] + 1).': { block:'.$this->stats['block'].$this->show_block_time_indicator().'  chains:'.number_format($this->stats['chains']).'  links:'.number_format($this->stats['links']).'  links-confirmed:'.number_format($this->stats['links-confirmed'])." }\r\n";
 			echo '[main] mempool: { tx-count:'.$this->mempool['size'].'  total-size:'.number_format($this->mempool['bytes']).' bytes  ram:'.number_format($this->mempool['usage'])." bytes }\r\n";
-			
+			// If there are any inactive chains, show how many in the console
 			if($this->stats['chains-inactive'] > 0) echo "\r\n*** ".$this->stats['chains-inactive']." chains are inactive due to error\r\n";
 			
-			// Iterate through non-empty inputs array after 1-second wait
+			// Sleep for a sec before gathering and spending inputs
+			// We sleep here so that links can be built and the loop iteration will
+			// update the statistics above with those new links before the sleep reoccurs
 			sleep(1);
 			/**
 			 *		BEGIN INPUTS ITERATION
 			 * 
 			 */
-			// Get current inputs (0+ conf)
+			// Get all confirmed and unconfirmed inputs
 			$inputs = $this->get_unspent_inputs();
 			if(!empty($inputs)) {
 				for($i = 0; $i < count($inputs); $i++) {
@@ -113,96 +137,78 @@ class velocity {
 					 *		CHECK INPUTS
 					 * 
 					 */
-					$input = $inputs[$i];
+					$this->tx_craft['input'] = $input = $inputs[$i];
 					// If this input has not yet been chained, we start a new chain
-					if($debug) echo "[debug] checking if input ".($i + 1)." is chained...";
+					if($this->debug) echo "[debug] checking if input ".($i + 1)." is chained...";
 					if(($chain_index = $this->is_chained_input($input)) === false) {
-						if($debug) echo " NO; initializing new chain\r\n";
+						if($this->debug) echo " NO; initializing new chain\r\n";
 						// put new chain on front of chains array; chain index is 0
 						array_unshift($this->chains, $this->new_chain($input));
 						$chain_index = 0;
-					} else if($debug) echo " YES; initializing existing chain\r\n";
+					} else if($this->debug) echo " YES; initializing existing chain\r\n";
 					
 					// Set the chain var as current chain index
 					$chain = $this->chains[$chain_index];
 					$num_chains = count($this->chains);
-					$chain_log_prefix = "[debug] [chain ".($chain_index + 1)."/$num_chains]";
+					$this->chain_log_prefix = $chain_log_prefix = "[debug] [chain ".($chain_index + 1)."/$num_chains]";
 					
 					// If the chain has been marked inactive, continue to next chain
-					if($debug) echo $chain_log_prefix." checking if chain is active...";
+					if($this->debug) echo $chain_log_prefix." checking if chain is active...";
 					if(!$chain['state']['active']) {
-						if($debug) echo " NO; continuing to next chain...\r\n";
+						if($this->debug) echo " NO; continuing to next chain...\r\n";
 						continue;
-					} else if($debug) echo " YES\r\n";
+					} else if($this->debug) echo " YES\r\n";
 					$chain['state']['active'] = true;
 					
 					// Only proceed if input is also ready to spend
-					if($debug) echo $chain_log_prefix." checking if chain tip is ready to spend...";
+					if($this->debug) echo $chain_log_prefix." checking if chain tip is ready to spend...";
 					if($this->is_input_ready($chain['tip'])) {
+		
+						// If this input is from an unconfirmed tx, we must reference its parent
+						$this->tx_craft['prevtxs'] = [];
+						if($this->is_unconfirmed_input($i)) {
+							if($this->debug) echo $this->chain_log_prefix." spending unconfirmed tx; preparing prevtxs array...";
+							$this->tx_craft['prevtxs'][] = $this->get_prevtx($input, $i);
+							if($this->debug) echo " OK\r\n";
+						} else if($this->debug) echo $this->chain_log_prefix." spending confirmed tx; continuing...\r\n";
 						
 						/**
 						 *		TRANSACTION CRAFTING
 						 * 
 						 */
-						/*
-						* Will be moving to a switch() loop embedded within a while() loop that performs $steps
 						$steps = [
 							'getspendable',
 							'getoutputs',
-							'getsignrawtx',
-							'getsignnewrawtx',
-							'sendrawtx'
+							'signrawtx',
+							'adjustsignrawtx',
+							// 'sendrawtx' // don't send the tx inside the while() loop.. only craft the tx
 						];
-						*/
-						if($debug) echo " YES\r\n";
-						$spendable = $this->get_spendable($input);
-						if($debug) echo $chain_log_prefix." spendable amount:\t$spendable\r\n";
 						
-						// Set up outputs to distribute coin(s)
-						if($debug) echo $chain_log_prefix." preparing outputs...";
-						$outputs = [$this->daemon->getnewaddress() => $spendable];
-						if($debug) echo " OK\r\n";
-						
-						if($this->config['add_op_return']) {
-							if($debug) echo $chain_log_prefix." adding random OP_RETURN data to tx output...";
-							$outputs['data'] = gen_tx_data();
-							if($debug) echo " OK\r\n";
+						// Once the tx is crafted, we exit the while() loop to spend the tx
+						$tx_crafted = false;
+						$step = current($steps);
+						while($tx_crafted === false) {
+							$function = 'tx_craft_'.$step;
+							$this->$function();
+							
+							// If last step, tx is crafted
+							// otherwise proceed to next step
+							if($step == $steps[count($steps) - 1]) $tx_crafted = true;
+							else $step = next($steps);
 						}
-						
-						// If this input is from an unconfirmed tx, we must reference its parent
-						$prevtxs = [];
-						if($this->is_unconfirmed_input($i)) {
-							if($debug) echo $chain_log_prefix." spending unconfirmed tx; preparing prevtxs array...";
-							$prevtxs[] = $this->get_prevtx($input, $i);
-							if($debug) echo " OK\r\n";
-						} else if($debug) echo $chain_log_prefix." spending confirmed tx; continuing...\r\n";
-						
-						// Create + sign new tx with above inputs/outputs
-						if($debug) echo $chain_log_prefix." signing initial tx...";
-						if(!$signed_tx = $this->daemon->signrawtransaction(
-							$raw_tx = $this->daemon->createrawtransaction([$input], $outputs), $prevtxs
-						)) { die($debug ? " FAIL\r\n": "[error] first createrawtransaction RPC call failed\r\n".' *** reason:'.$this->daemon->error."\r\n *** raw_tx:".json_encode($raw_tx)."\r\n"); }
-						else { if($debug) echo " OK\r\n"; }
-						
-						// Adjust fee on signed tx and create new signed tx
-						if($debug) echo $chain_log_prefix." signing new tx with fee adjustment...";
-						if(!$signed_tx = $this->daemon->signrawtransaction(
-							$this->adjust_for_fee($signed_tx, [$input], $outputs), $prevtxs
-						)) { die($debug ? " FAIL\r\n": "[error] second createrawtransaction RPC call failed\r\n".' *** reason:'.$this->daemon->error."\r\n *** raw_tx:".json_encode($raw_tx)."\r\n"); }
-						else { if($debug) echo " OK\r\n"; }
 						
 						/**
-						 *		SEND THE TX :)
+						 *		SPEND THE CRAFTED TX :)
 						 * 
 						 */
-						if($debug) echo $chain_log_prefix." sending tx...";
-						$txid = $this->daemon->sendrawtransaction($signed_tx['hex']);
+						if($this->debug) echo $chain_log_prefix." sending tx...";
+						$txid = $this->daemon->sendrawtransaction($this->tx_craft['signed_tx']['hex']);
 						if($txid) {
-							if($debug) echo " OK\r\n";
-							if($debug) echo $chain_log_prefix."\t$txid\r\n";
+							if($this->debug) echo " OK\r\n";
+							if($this->debug) echo $chain_log_prefix."\t$txid\r\n";
 						}
 						else {
-							if($debug) echo "FAIL\r\n[error] ".$this->daemon->error."\r\n";
+							if($this->debug) echo "FAIL\r\n[error] ".$this->daemon->error."\r\n";
 							else echo "[error] ".$chain_log_prefix." ".$this->daemon->error."\r\n";
 						}
 						
@@ -249,12 +255,13 @@ class velocity {
 						}
 						
 						// Continue the inputs loop after a random wait
-						if($debug) echo $chain_log_prefix." done!\r\n";
+						if($this->debug) echo $chain_log_prefix." done!\r\n";
 						usleep(mt_rand(650000,1150000));
 						continue;
-					} else if($debug) echo " NO; continuing...\r\n";
+						
+					} else if($this->debug) echo " NO; continuing...\r\n";
 				}
-			} else if($debug) echo "[main] no inputs to spend...\r\n";
+			} else if($this->debug) echo "[main] no inputs to spend...\r\n";
 		}
 	}
 	/**
@@ -436,6 +443,47 @@ class velocity {
 		return $inputs;
 	}
 	
+	function tx_craft_getspendable() {
+		if($this->debug) echo " YES\r\n";
+		$this->tx_craft['spendable'] = $spendable = $this->get_spendable($this->tx_craft['input']);
+		if($this->debug) echo $this->chain_log_prefix." spendable amount:\t$spendable\r\n";
+		
+		
+	}
+	
+	function tx_craft_getoutputs() {
+	
+		// Set up outputs to distribute coin(s)
+		if($this->debug) echo $this->chain_log_prefix." preparing outputs...";
+		$this->tx_craft['outputs'] = [$this->daemon->getnewaddress() => $this->tx_craft['spendable']];
+		if($this->debug) echo " OK\r\n";
+		
+		if($this->config['add_op_return']) {
+			if($this->debug) echo $this->chain_log_prefix." adding random OP_RETURN data to tx output...";
+			$this->tx_craft['outputs']['data'] = gen_tx_data();
+			if($this->debug) echo " OK\r\n";
+		}
+		
+	}
+	
+	function tx_craft_signrawtx() {
+		// Create + sign new tx with above inputs/outputs
+		if($this->debug) echo $this->chain_log_prefix." signing initial tx...";
+		if(!$this->tx_craft['signed_tx'] = $this->daemon->signrawtransaction(
+			$this->tx_craft['raw_tx'] = $this->daemon->createrawtransaction([$this->tx_craft['input']], $this->tx_craft['outputs']), $this->tx_craft['prevtxs']
+		)) { die($this->debug ? " FAIL\r\n": "[error] first createrawtransaction RPC call failed\r\n".' *** reason:'.$this->daemon->error."\r\n *** raw_tx:".json_encode($raw_tx)."\r\n"); }
+		else { if($this->debug) echo " OK\r\n"; }
+	}
+	
+	function tx_craft_adjustsignrawtx() {
+		// Adjust fee on signed tx and create new signed tx
+		if($this->debug) echo $this->chain_log_prefix." signing new tx with fee adjustment...";
+		if(!$this->tx_craft['signed_tx'] = $this->daemon->signrawtransaction(
+			$this->adjust_for_fee($this->tx_craft['signed_tx'], [$this->tx_craft['input']], $this->tx_craft['outputs']), $this->tx_craft['prevtxs']
+		)) { die($this->debug ? " FAIL\r\n": "[error] second createrawtransaction RPC call failed\r\n".' *** reason:'.$this->daemon->error."\r\n *** raw_tx:".json_encode($raw_tx)."\r\n"); }
+		else { if($this->debug) echo " OK\r\n"; }
+	}
+	
 	function adjust_for_fee($signed_tx, array $inputs, array $outputs) {
 		$decoded_tx = $this->daemon->decoderawtransaction($signed_tx['hex']);
 		$last_output = array_shift($decoded_tx['vout']);
@@ -444,12 +492,35 @@ class velocity {
 		
 		return $this->daemon->createrawtransaction($inputs, $outputs);
 	}
+	
+	/*
+	function setup_outputs(float $spendable) {
+		$num_rcpts = 1; //mt_rand(1, 2);
+		
+		for($i = 0; $i < $num_rcpts; $i++)
+			$addresses[] = $this->daemon->getnewaddress();
+		
+		$percent_allocated = 0.00; // 1.00 = 100%
+		$outputs = [];
+		for($i = 0; $i < count($addresses); $i++) {
+			$i + 1 == count($addresses) ?
+				$percentage = number_format(1.0000 - $percent_allocated, 4):
+				$percentage = number_format(mt_rand(((1 / $num_rcpts) - self::TX_SPLIT_SWAY)*10000, ((1 / $num_rcpts) + self::TX_SPLIT_SWAY)*10000) / 10000, 4);
+			
+			$outputs[$addresses[$i]] = (float) number_format($spendable * $percentage, 8);
+			$percent_allocated += $percentage;
+		}
+		
+		return $outputs;
+		
+	}
+	*/
 	/**
 	 * get_spendable(): Gets total spendable amount of specific vout in input
 	 * 
 	 * @param (array) $input: input txid/vout array
 	 * 
-	 * return (float): returns the input's vout value
+	 * return (float): returns the input'ss vout value
 	 */
 	function get_spendable(array $input) {
 		$decoded_tx = $this->daemon->decoderawtransaction(
@@ -467,6 +538,9 @@ class velocity {
 	}
 	
 }
+
+// =-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=
+
 /*
 EasyBitcoin-PHP
 A simple class for making calls to Bitcoin's API using PHP.
