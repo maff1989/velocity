@@ -82,7 +82,7 @@ class velocity {
 		while(true) {
 			system('clear');
 			echo "\r\n";
-			echo "\tVelocity, for cryptocurrencies (".$this->version.")\r\n";
+			echo "\tVelocity, for cryptocurrencies (v".$this->version.")\r\n";
 			echo "\trunning since ".date('m/d/Y H:i:s', $start_time)."\r\n";
 			echo "\r\n";
 			
