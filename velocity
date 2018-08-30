@@ -7,10 +7,11 @@
 $config['daemon'] = ['host' => '127.0.0.1', 'port' => '8332']; // RPC for Bitcoin daemon
 $config['daemon']['user'] = 'x'; // rpcuser
 $config['daemon']['pass'] = 'x'; // rpcpassword
-$config['block_time'] = 600; // the daemon's block time in seconds
+$config['avg_block_time'] = 600; // the daemon's avg block time in seconds
 $config['min_sat_byte'] = 1; // minimum number of satoshis per byte to pay for transaction fees
 $config['debug'] = false; // enable/disable extra debugging info
-$config['add_op_return'] = true; // enable/disable random OP_RETURN data in txs to increase size by 80 ASCII bytes
+$config['add_op_return'] = false; // enable/disable random OP_RETURN data in txs to increase size by 80 ASCII bytes
+$config['min_input_amount'] = 0.001; // minimum input size when splintering large inputs; default = 0.001
 
 
 // =-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=
@@ -31,7 +32,7 @@ exit(0);
 class velocity {
 	const MIN_TX_AMOUNT = 0.00001000; // Minimum tx spend amount
 	const MIN_TX_AGE = 25; // Minimum 0-conf tx age in seconds required before spend
-	const VERSION = '0.2'; // optimized tx crafting logic
+	const VERSION = '0.3'; // optimized tx crafting logic
 	// for tx calculations
 	// Not using this because we aren't splitting the output amount between addresses
 	// const TX_SPLIT_SWAY = 0.05; // 5% sway
@@ -39,17 +40,18 @@ class velocity {
 	// Common properties
 	private $daemon; // JSON-RPC connection to coin daemon
 	private $height; // starting daemon block height
-	private $height_time = 0; // time we received latest daemon height
+	private $height_time; // time we received latest daemon height
 	private $unspent = []; // our wallet's unspent inputs (0+ confirmations)
 	private $mempool = []; // numerical array of our daemon's mempool txids
 	private $chains = []; // numerical array of transaction chains
+	private $inputs = ['splintered' => [], 'to_splinter' => []]; // arrays of splintered and to-be-splintered inputs
 	private $stats = [ // runtime stats counters
 		'block' => 0, // current daemon height
 		'blocks-seen' => 0, // blocks seen since start
 		'chains' => 0, // num active chains (i.e. [...|input]->[output|input]->[output|...])
 		'chains-inactive' => 0, // num chains w/ error and marked inactive
 		'links' => 0, // number of links created during current round
-		'links-confirmed' => 0 // total number of links confirmed by network
+		'links-confirmed' => 0, // total number of links confirmed by network
 	];
 	/**
 	 * __construct(): Initiate the Velocity instance by applying user config and testing daemon RPC connection. Also set some properties
@@ -67,8 +69,15 @@ class velocity {
 		
 		// initial property values
 		$this->height = $this->daemon->getblockcount();
+		// Set height time to best block's time
+		$this->height_time = $this->get_last_block_time();
 		// Debug mode?
 		$this->debug = $this->config['debug'];
+		// Don't allow more than 100 outputs when splintering an input
+		$this->config['max_splinter_count'] = 100;
+		// Don't allow <0.001 min_input_amt
+		if($this->config['min_input_amount'] < 0.001) die("[error] min_input_amount of ".$this->config['min_input_amount']." must be greater than 0.001\r\n");
+		
 	}
 	/**
 	 * init(): Primary runtime function; executes the Velocity server
@@ -77,49 +86,22 @@ class velocity {
 	 */
 	function init() {
 		
-		$start_time = time();
+		$this->start_time = time();
 		// Run until CTRL+C or other stop signal
 		while(true) {
-			system('clear');
-			echo "\r\n";
-			echo "\tVelocity, for cryptocurrencies (v".$this->version.")\r\n";
-			echo "\trunning since ".date('m/d/Y H:i:s', $start_time)."\r\n";
-			echo "\r\n";
-			
 			// Verify daemon connection before proceeding with loop iteration
 			if(!$this->check_daemon()) die("[error] JSON-RPC connection to ".$this->config['daemon']['host'].':'.$this->config['daemon']['port']." was lost.\r\n*** reason: ".$this->daemon->error."\r\n");
-			
-			// Update block height
-			$this->prev_height = $this->height;
-			$this->height = $this->daemon->getblockcount();
 			
 			/**
 			 *		NEW BLOCK HANDLER
 			 * 
 			 */
-			if($this->height > $this->prev_height) {
-				// Set current time of block height
-				$this->height_time = time();
-				// Increment blocks seen stat
-				$this->stats['blocks-seen'] += 1;
-				// Add prev links to confirmed count
-				$this->stats['links-confirmed'] += $this->stats['links'];
-				// Reset all chains after new block; start with fresh tx chains
-				$this->chains = [];
-				
-			}
-			
-			// Gather some updates for the console
-			$this->mempool = $this->daemon->getmempoolinfo();
-			$this->update_runtime_stats();
+			$this->update_block_height();
 			
 			/**
 			 *		CONSOLE STATUS UPDATE
 			 */
-			echo '[main] round '.($this->stats['blocks-seen'] + 1).': { block:'.$this->stats['block'].$this->show_block_time_indicator().'  chains:'.number_format($this->stats['chains']).'  links:'.number_format($this->stats['links']).'  links-confirmed:'.number_format($this->stats['links-confirmed'])." }\r\n";
-			echo '[main] mempool: { tx-count:'.$this->mempool['size'].'  total-size:'.number_format($this->mempool['bytes']).' bytes  ram:'.number_format($this->mempool['usage'])." bytes }\r\n";
-			// If there are any inactive chains, show how many in the console
-			if($this->stats['chains-inactive'] > 0) echo "\r\n*** ".$this->stats['chains-inactive']." chains are inactive due to error\r\n";
+			$this->update_console();
 			
 			// Sleep for a sec before gathering and spending inputs
 			// We sleep here so that links can be built and the loop iteration will
@@ -133,11 +115,75 @@ class velocity {
 			$inputs = $this->get_unspent_inputs();
 			if(!empty($inputs)) {
 				for($i = 0; $i < count($inputs); $i++) {
+					// Initialize new tx_craft array
+					$this->tx_craft = [];
+					// Set the current input
+					$this->tx_craft['input'] = $input = $inputs[$i];
+					
+					// Continue to next input if splintered input is awaiting block confirmation
+					if(in_array($input['txid'].':'.$input['vout'], $this->inputs['splintered'])) continue;
+					
+					// If this input is from an unconfirmed tx, we must reference its parent
+					if($this->debug) echo "[debug] checking if input is from an unconfirmed tx...";
+					$this->tx_craft['prevtxs'] = [];
+					if($this->is_unconfirmed_input($i)) {
+						if($this->debug) echo " YES; preparing prevtxs array...";
+						$this->tx_craft['prevtxs'][] = $this->get_prevtx($input, $i);
+						if($this->debug) echo " OK\r\n";
+					} else if($this->debug) echo $this->chain_log_prefix." NO\r\n";
+					
+					
+					/**
+					 *		CHECK SPLINTER
+					 * 
+					 */
+					// We must craft a special transaction for Splinter
+					// We divide input amount by min_input_amount to create X number of outputs in a single tx
+					// Then we set the new input inactive to await a new block for spending
+					$this->tx_craft_getspendable();
+					if($this->tx_craft['spendable'] > $this->config['min_input_amount']) {
+						// Round up to nearest whole number.. last output receives remaining amount
+						$num_outputs = ceil($this->tx_craft['spendable'] / $this->config['min_input_amount']);
+						
+						// Ensure only the max_splinter_count number of outputs, otherwise tx craft could fail
+						if($num_outputs > $this->config['max_splinter_count']) $num_outputs = $this->config['max_splinter_count'];
+						
+						echo "\r\n*** large input detected; splintering into $num_outputs outputs...\r\n";
+						
+						for($j = 0; $j < $num_outputs; $j++) {
+							$amount = ($j == ($num_outputs - 1) ? (float) $this->tx_craft['spendable'] - number_format($this->config['min_input_amount'] * ($num_outputs - 1), 8): $this->config['min_input_amount']);
+							$this->tx_craft['outputs'][$this->daemon->getnewaddress()] = $amount;
+						}
+						
+						$this->tx_craft_signrawtx();
+						$this->tx_craft_adjustsignrawtx();
+						
+						$txid = $this->tx_craft_spend($ignore_chain = true);
+						
+						if($txid) {
+							// After sending the tx, set each txid:vout in the inactive inputs array
+							for($j = 0; $j < count($this->tx_craft['outputs']); $j++) {
+								$this->inputs['splintered'][] = "$txid:$j";
+							}
+							
+						} else {
+							// if tx failed to send, set the input inactive and wait for next block
+							$this->inputs['to_splinter'][] = $this->tx_craft['input']['txid'].':'.$this->tx_craft['input']['vout'];
+						}
+						
+						// continue to next input loop iteration
+						if($this->update_block_height()) continue 2;
+						$this->update_console();
+						usleep(mt_rand(65000,115000));
+						continue;
+					}
+					
+					
 					/**
 					 *		CHECK INPUTS
 					 * 
 					 */
-					$this->tx_craft['input'] = $input = $inputs[$i];
+					
 					// If this input has not yet been chained, we start a new chain
 					if($this->debug) echo "[debug] checking if input ".($i + 1)." is chained...";
 					if(($chain_index = $this->is_chained_input($input)) === false) {
@@ -163,25 +209,18 @@ class velocity {
 					// Only proceed if input is also ready to spend
 					if($this->debug) echo $chain_log_prefix." checking if chain tip is ready to spend...";
 					if($this->is_input_ready($chain['tip'])) {
-		
-						// If this input is from an unconfirmed tx, we must reference its parent
-						$this->tx_craft['prevtxs'] = [];
-						if($this->is_unconfirmed_input($i)) {
-							if($this->debug) echo $this->chain_log_prefix." spending unconfirmed tx; preparing prevtxs array...";
-							$this->tx_craft['prevtxs'][] = $this->get_prevtx($input, $i);
-							if($this->debug) echo " OK\r\n";
-						} else if($this->debug) echo $this->chain_log_prefix." spending confirmed tx; continuing...\r\n";
+						if($this->debug) echo " YES\r\n";
 						
 						/**
 						 *		TRANSACTION CRAFTING
 						 * 
 						 */
 						$steps = [
-							'getspendable',
+							// 'getspendable', // we get this before checking Splinter
 							'getoutputs',
 							'signrawtx',
 							'adjustsignrawtx',
-							// 'sendrawtx' // don't send the tx inside the while() loop.. only craft the tx
+							// 'spend' // don't send the tx inside the while() loop.. only craft the tx
 						];
 						
 						// Once the tx is crafted, we exit the while() loop to spend the tx
@@ -200,63 +239,16 @@ class velocity {
 						/**
 						 *		SPEND THE CRAFTED TX :)
 						 * 
-						 */
-						if($this->debug) echo $chain_log_prefix." sending tx...";
-						$txid = $this->daemon->sendrawtransaction($this->tx_craft['signed_tx']['hex']);
-						if($txid) {
-							if($this->debug) echo " OK\r\n";
-							if($this->debug) echo $chain_log_prefix."\t$txid\r\n";
-						}
-						else {
-							if($this->debug) echo "FAIL\r\n[error] ".$this->daemon->error."\r\n";
-							else echo "[error] ".$chain_log_prefix." ".$this->daemon->error."\r\n";
-						}
-						
-						/**
-						 *		ERROR HANDLING
+						 *		ERROR HANDLING + CLEANUP INCLUDED
 						 * 
 						 */
-						$error = false;
-						if($e = $this->daemon->error) {
-							// Since input wasn't spent, we leave chain tip as-is and
-							// only update the state accordingly
-							$chain['error']['string'] = $e;
-							$chain['error']['height'] = $this->height;
-							$chain['state']['active'] = false;
-							// $chain['state']['ready'] = false;
-							
-							// Update chains array with latest chain data
-							$this->chains[$chain_index] = $chain;
-							
-							// Houston, we have a spending error
-							$error = true;
-						}
+						$this->tx_craft_spend($ignore_chain = false, $chain, $chain_index);
 						
-						/**
-						 *		CLEANUP
-						 * 
-						 */
-						// Update chain info if we haven't received a spending error
-						if(!$error) {
-							// Move the spent input to the links array
-							array_unshift($chain['links'], $chain['tip']);
-							// Update chain tip with latest input
-							$chain['tip'] = [
-								'txid' => "$txid:0", // always set first output since only 1 rcpt
-								'time' => time(),
-								'input_used' => [
-									'txid' => $input['txid'],
-									'vout' => $input['vout']
-								]
-							];
-							
-							// Update chains array with latest chain data
-							$this->chains[$chain_index] = $chain;
-						}
-						
+						// Check for new block
+						if($this->update_block_height()) continue 2;
+						$this->update_console();
 						// Continue the inputs loop after a random wait
-						if($this->debug) echo $chain_log_prefix." done!\r\n";
-						usleep(mt_rand(650000,1150000));
+						usleep(mt_rand(65000,115000));
 						continue;
 						
 					} else if($this->debug) echo " NO; continuing...\r\n";
@@ -283,6 +275,68 @@ class velocity {
 		$this->stats['chains-inactive'] = $states['inactive'];
 		
 		$this->stats['links'] = ($links = $this->get_link_count());
+	}
+	
+	function update_block_height() {
+		
+		// Update block height
+		$this->prev_height = $this->height;
+		$this->height = $this->daemon->getblockcount();
+		if($this->height > $this->prev_height) {
+			// Set current time of block height
+			$this->height_time = $this->get_last_block_time();
+			// Increment blocks seen stat
+			$this->stats['blocks-seen'] += 1;
+			// Add prev links to confirmed count
+			$this->stats['links-confirmed'] += $this->stats['links'];
+			// Reset all chains after new block; start with fresh tx chains
+			$this->chains = [];
+			
+			// Reset the inactive and disabled inputs since new block means they are ready to chain
+			$this->inputs['splintered'] = [];
+			$this->inputs['to_splinter'] = [];
+			
+			return true;
+			
+		}
+		
+		return false;
+	}
+	
+	function update_console() {
+		// Need to update stats first
+		$this->mempool = $this->daemon->getmempoolinfo();
+		$this->update_runtime_stats();
+		// clear and print to screen
+		system('clear');
+		echo "\r\n";
+		echo "\tVelocity, for cryptocurrencies (v".$this->version.")\r\n";
+		echo "\trunning since ".date('m/d/Y H:i:s', $this->start_time)."\r\n";
+		echo "\r\n";
+		echo '[main] round '.($this->stats['blocks-seen'] + 1).': { block:'.$this->stats['block'].$this->show_block_time_indicator().'  chains:'.number_format($this->stats['chains']).'  links:'.number_format($this->stats['links']).'  links-confirmed:'.number_format($this->stats['links-confirmed'])." }\r\n";
+		echo '[main] mempool: { tx-count:'.$this->mempool['size'].'  total-size:'.number_format($this->mempool['bytes']).' bytes  ram:'.number_format($this->mempool['usage'])." bytes }\r\n";
+		// If there are any inactive chains, show how many in the console
+		if($this->stats['chains-inactive'] > 0) {
+			echo "\r\n*** ".$this->stats['chains-inactive']." chains are inactive due to error\r\n";
+			if($this->debug) {
+				// additional debug info
+			}
+		}
+		// If any inputs are currently pending a block confirmation, show how many in the console
+		if($num_splintered = count($this->inputs['splintered']) > 0) {
+			echo "\r\n*** $num_splintered splintered input(s) will be chained after new block\r\n";
+			if($this->debug) {
+				// additional debug info
+			}
+		}
+		
+		if($num_to_splinter = count($this->inputs['to_splinter']) > 0) {
+			echo "\r\n*** $num_to_splinter large input(s) will be splintered after new block\r\n";
+			if($this->debug) {
+				// additional debug info
+			}
+		}
+		
 	}
 	/**
 	 * new_chain(): Create new chain array with the provided input $txid:$vout
@@ -330,10 +384,14 @@ class velocity {
 		}
 	}
 	
+	function get_last_block_time() {
+		$block = $this->daemon->getblock($this->daemon->getbestblockhash());
+		return $block['time'];
+	}
+	
 	function show_block_time_indicator() {
-		if($this->height_time == 0) return '';
-		elseif(time() - $this->height_time < (0.05 * $this->config['block_time'])) return '(!)'; // new/recent block!
-		elseif(time() - $this->height_time > $this->config['block_time']) return '(?)'; // where is the next block?
+		if(time() - $this->height_time < (0.10 * $this->config['avg_block_time'])) return '(!)'; // new/recent block!
+		elseif(time() - $this->height_time > $this->config['avg_block_time']) return '(?)'; // where is the next block?
 		
 		// If not matched, return empty string
 		return '';
@@ -416,14 +474,13 @@ class velocity {
 	 */
 	function is_input_ready(array $chain_tip) {
 		
-		$ready = false;
 		// Input is ready if it is of the minimum age for newly-created inputs
 		$ready = (bool) (time() > ($chain_tip['time'] + self::MIN_TX_AGE));
 		
 		return $ready;
 	}
 	/**
-	 * Returns inputs in [{"txid":"abcdef012...":"vout":n},{...}] structure
+	 * Returns inputs in [{"txid":"abcdef012...","vout":n},{...}] structure
 	 */
 	function get_unspent_inputs() {
 		// Verify daemon connection
@@ -444,11 +501,8 @@ class velocity {
 	}
 	
 	function tx_craft_getspendable() {
-		if($this->debug) echo " YES\r\n";
 		$this->tx_craft['spendable'] = $spendable = $this->get_spendable($this->tx_craft['input']);
 		if($this->debug) echo $this->chain_log_prefix." spendable amount:\t$spendable\r\n";
-		
-		
 	}
 	
 	function tx_craft_getoutputs() {
@@ -471,7 +525,7 @@ class velocity {
 		if($this->debug) echo $this->chain_log_prefix." signing initial tx...";
 		if(!$this->tx_craft['signed_tx'] = $this->daemon->signrawtransaction(
 			$this->tx_craft['raw_tx'] = $this->daemon->createrawtransaction([$this->tx_craft['input']], $this->tx_craft['outputs']), $this->tx_craft['prevtxs']
-		)) { die($this->debug ? " FAIL\r\n": "[error] first createrawtransaction RPC call failed\r\n".' *** reason:'.$this->daemon->error."\r\n *** raw_tx:".json_encode($raw_tx)."\r\n"); }
+		)) { die($this->debug ? " FAIL\r\n": "[error] first createrawtransaction RPC call failed\r\n".' *** reason:'.$this->daemon->error."\r\n *** raw_tx:".json_encode($this->tx_craft['raw_tx'])."\r\n"); }
 		else { if($this->debug) echo " OK\r\n"; }
 	}
 	
@@ -480,17 +534,84 @@ class velocity {
 		if($this->debug) echo $this->chain_log_prefix." signing new tx with fee adjustment...";
 		if(!$this->tx_craft['signed_tx'] = $this->daemon->signrawtransaction(
 			$this->adjust_for_fee($this->tx_craft['signed_tx'], [$this->tx_craft['input']], $this->tx_craft['outputs']), $this->tx_craft['prevtxs']
-		)) { die($this->debug ? " FAIL\r\n": "[error] second createrawtransaction RPC call failed\r\n".' *** reason:'.$this->daemon->error."\r\n *** raw_tx:".json_encode($raw_tx)."\r\n"); }
+		)) { die($this->debug ? " FAIL\r\n": "[error] second createrawtransaction RPC call failed\r\n".' *** reason:'.$this->daemon->error."\r\n *** raw_tx:".json_encode($this->tx_craft['raw_tx'])."\r\n"); }
 		else { if($this->debug) echo " OK\r\n"; }
+	}
+	
+	function tx_craft_spend(bool $ignore_chain, array $chain = [], int $chain_index = -1) {
+		if($this->debug) echo $this->chain_log_prefix." sending tx...";
+		$txid = $this->daemon->sendrawtransaction($this->tx_craft['signed_tx']['hex']);
+		if($txid) {
+			if($this->debug) echo " OK\r\n";
+			if($this->debug) echo $this->chain_log_prefix." tx:$txid\r\n";
+		}
+		else {
+			if($this->debug) echo "FAIL\r\n[error] ".$this->daemon->error."\r\n";
+			else echo "[error] ".$this->chain_log_prefix." ".$this->daemon->error."\r\n";
+		}
+		
+		// assuming we are processing chain state following the tx spend...
+		if(!$ignore_chain) {
+			// Handle any daemon errors if present
+			$error = false;
+			if($e = $this->daemon->error) {
+				// Since input wasn't spent, we leave chain tip as-is and
+				// only update the state accordingly
+				$chain['error']['string'] = $e;
+				$chain['error']['height'] = $this->height;
+				$chain['state']['active'] = false;
+				// $chain['state']['ready'] = false;
+				
+				// Update chains array with latest chain data
+				$this->chains[$chain_index] = $chain;
+				
+				// Houston, we have a spending error
+				$error = true;
+			}
+			
+			// Update chain info if we haven't received a spending error
+			if(!$error) {
+				// Move the spent input to the links array
+				array_unshift($chain['links'], $chain['tip']);
+				// Update chain tip with latest input
+				$chain['tip'] = [
+					'txid' => "$txid:0", // always set first output since only 1 rcpt
+					'time' => time(),
+					'input_used' => [
+						'txid' => $this->tx_craft['input']['txid'],
+						'vout' => $this->tx_craft['input']['vout']
+					]
+				];
+				
+				// Update chains array with latest chain data
+				$this->chains[$chain_index] = $chain;
+			}
+			
+		}
+		
+		return $txid;
+		
 	}
 	
 	function adjust_for_fee($signed_tx, array $inputs, array $outputs) {
 		$decoded_tx = $this->daemon->decoderawtransaction($signed_tx['hex']);
-		$last_output = array_shift($decoded_tx['vout']);
-		// Update the output address amount to exclude fee in bytes
-		$outputs[$last_output['scriptPubKey']['addresses'][0]] = (float) ($last_output['value'] - number_format(($decoded_tx['size'] / 100000000) * $this->config['min_sat_byte'], 8));
 		
-		return $this->daemon->createrawtransaction($inputs, $outputs);
+		// loop through vouts backwards to adjust last eligible output
+		for($i = count($decoded_tx['vout']) - 1; $i >= 0; $i--) {
+			$vout = $decoded_tx['vout'][$i];
+			if(isset($vout['scriptPubKey']['addresses'])) {
+				$amount = (float) ($vout['value'] - number_format(($decoded_tx['size'] / 100000000) * $this->config['min_sat_byte'], 8));
+				// Only change the output if the amount is greater than 0 after adjusting for fee
+				if($amount > 0) {
+					$outputs[$vout['scriptPubKey']['addresses'][0]] = $amount;
+					return $this->daemon->createrawtransaction($inputs, $outputs);
+				}
+			}
+		}
+		
+		// If we haven't yet returned, assume we cannot pay for the tx
+		return false;
+		
 	}
 	
 	/*
