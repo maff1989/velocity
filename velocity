@@ -37,7 +37,7 @@ class velocity {
 	const MIN_TX_AMOUNT = 0.00002000; // Minimum tx spend amount
 	const MAX_ADDR_COUNT = 1000; // Maximum number of addresses to use for outputs; don't generate more than this number for the wallet
 	const MIN_TX_AGE = 25; // Minimum 0-conf tx age in seconds required before spend
-	const VERSION = '0.4'; // optimized tx crafting logic
+	const VERSION = '0.4.1'; // optimized tx crafting logic
 	// for tx calculations
 	// Not using this because we aren't splitting the output amount between addresses
 	// const TX_SPLIT_SWAY = 0.05; // 5% sway
@@ -88,8 +88,6 @@ class velocity {
 		$this->config['min_tx_amount'] = self::MIN_TX_AMOUNT;
 		// Maximum address_pool count; these are used in tx outputs throughout rounds
 		$this->config['max_addr_count'] = self::MAX_ADDR_COUNT;
-		// Array to hold txids sent to dust_collector
-		$this->config['dust_bin'] = [];
 	}
 	/**
 	 * init(): Primary runtime function; executes the Velocity server
@@ -140,7 +138,6 @@ class velocity {
 					if($this->debug) echo "[debug] using input:".$input['txid'].':'.$input['vout']."\r\n";
 					
 					// Skip dust collector inputs
-					// if(in_array($input['txid'], $this->config['dust_bin'])) continue;
 					if($input['address'] == $this->config['dust_collector']) continue;
 					
 					// Run some checks if the input is unconfirmed
@@ -293,8 +290,6 @@ class velocity {
 						 * 
 						 */
 						$txid = $this->tx_craft_spend($ignore_chain = false, $chain, $chain_index);
-						// If this was a dust_collector tx, take note
-						if(isset($this->tx_craft['send_to_dust'])) $this->config['dust_bin'][] = $txid;
 						
 						// Continue the inputs loop after a random wait
 						if($this->update_block_height()) continue 2;
