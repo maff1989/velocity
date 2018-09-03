@@ -37,7 +37,7 @@ $config['core']['max_splinter_count'] = 65; // max number of outputs for single 
  
 
 $v = new velocity($config);
-//$v->abandon_all();
+
 // RUN, BABY, RUN!!
 $v->init();
 
@@ -60,7 +60,8 @@ class velocity {
 	 *		PROGRAM VERSION
 	 * 
 	 */
-	const VERSION = '0.4.4'; // updated comments/vars/etc + misc code clean-up + fix prevtx
+	// const VERSION = '0.4.4'; // updated comments/vars/etc + misc code clean-up + fix prevtx
+	const VERSION = '0.4.5'; // dust addr and daemon sync checks added, plus other small fixes
 	
 	
 	/**
@@ -93,13 +94,17 @@ class velocity {
 		$this->config = $config;
 		// Set version number
 		$this->version = self::VERSION;
+		
 		// Connect to daemon
 		$this->daemon = new coindaemon($this->config['daemon']['user'], $this->config['daemon']['pass'], $this->config['daemon']['host'], $this->config['daemon']['port']);
 		// die if no daemon
 		if(!$this->check_daemon()) die ("[error] failed JSON-RPC connection to ".$this->config['daemon']['host'].':'.$this->config['daemon']['port']."\r\n*** reason: ".$this->daemon->error."\r\n");
 		
-		// die if no dust config
+		// die if no dust config; generate dust address
 		if(!isset($this->config['coin']['dust_collector']) || $this->config['coin']['dust_collector'] == 'PUT_UNIQUE_ADDRESS_HERE') die("[error] no dust_collector address configured; generating one: ".$this->daemon->getnewaddress()."\r\n*** add this address as the value of the ".'"$config[\'coin\'][\'dust_collector\']"'." variable\r\n");
+		
+		// die if dust address is not valid for daemon; generate dust address
+		if(substr($this->config['coin']['dust_collector'], 0, 1) != substr(array_pop($this->build_address_pool(1)), 0, 1)) die("[error] dust_collector address appears to be for different coin; generating dust address: ".$this->daemon->getnewaddress()."\r\n*** add this address as the value of the ".'"$config[\'coin\'][\'dust_collector\']"'." variable\r\n");
 		
 		// daemon height
 		$this->height = $this->daemon->getblockcount();
@@ -132,6 +137,9 @@ class velocity {
 			// Verify daemon connection before proceeding with loop iteration
 			if(!$this->check_daemon()) die("[error] JSON-RPC connection to ".$this->config['daemon']['host'].':'.$this->config['daemon']['port']." was lost.\r\n*** reason: ".$this->daemon->error."\r\n");
 			
+			// Check if daemon is synced
+			$this->daemon_synced = $this->is_daemon_synced();
+			
 			/**
 			 *		NEW BLOCK HANDLER
 			 * 
@@ -146,6 +154,13 @@ class velocity {
 			
 			// Sleep for a sec before gathering and spending inputs
 			sleep(1);
+			
+			// Only proceed if daemon is synced
+			if(!$this->daemon_synced) {
+				$this->stats['blocks-seen'] = 0;
+				continue;
+			}
+			
 			/**
 			 *		BEGIN INPUTS ITERATION
 			 * 
@@ -376,6 +391,14 @@ class velocity {
 		$this->stats['links'] = ($links = $this->get_link_count());
 	}
 	/**
+	 * get_header_height(): Check with daemon for block header height (i.e. total blocks on network)
+	 * 
+	 * return (int): Number of block headers downloaded from peers
+	 */
+	function get_header_height() {
+		return $this->daemon->getblockchaininfo()['headers'];
+	}
+	/**
 	 * update_block_height(): Check with daemon to see if current height is greater than ours
 	 * 
 	 * return (bool): True if new height, false otherwise
@@ -385,6 +408,7 @@ class velocity {
 		// Update block height
 		$this->prev_height = $this->height;
 		$this->height = $this->daemon->getblockcount();
+		// If new block found...
 		if($this->height > $this->prev_height) {
 			// Set current time of block height
 			$this->height_time = $this->get_last_block_time();
@@ -423,12 +447,18 @@ class velocity {
 		system('clear');
 		echo "\r\n";
 		echo "\tVelocity, for cryptocurrencies (v".$this->version.")\r\n";
-		echo "\trunning since ".date('m/d/Y H:i:s', $this->start_time)."\r\n";
+		echo "\trunning \"".$this->get_network_id()."\" since ".date('m/d/Y H:i:s', $this->start_time)."\r\n";
 		echo "\r\n";
-		echo "\tDust collector:".$this->config['coin']['dust_collector']."\r\n";
+		echo "\tdust collector: ".$this->config['coin']['dust_collector']."\r\n";
 		echo "\r\n";
-		echo '[main] round '.($this->stats['blocks-seen'] + 1).': { block:'.$this->stats['block'].$this->get_block_time_indicator().'  chains:'.number_format($this->stats['chains']).'  links:'.number_format($this->stats['links']).'  links-confirmed:'.number_format($this->stats['links-confirmed'])." }\r\n";
-		echo '[main] mempool: { tx-count:'.$this->mempool['size'].'  total-size:'.number_format($this->mempool['bytes']).' bytes  ram:'.number_format($this->mempool['usage'])." bytes }\r\n";
+		
+		// Show round/daemon stats if daemon is ready
+		if($this->daemon_synced) {
+			echo '[main] round '.($this->stats['blocks-seen'] + 1).': { block:'.$this->stats['block'].$this->get_block_time_indicator().'  chains:'.number_format($this->stats['chains']).'  links:'.number_format($this->stats['links']).'  links-confirmed:'.number_format($this->stats['links-confirmed'])." }\r\n";
+			echo '[main] mempool: { tx-count:'.$this->mempool['size'].'  total-size:'.number_format($this->mempool['bytes']).' bytes  ram:'.number_format($this->mempool['usage'])." bytes }\r\n";
+		// Otherwise show waiting message
+		} else { echo "*** waiting for daemon to finish syncing\r\n*** height ".$this->height." of ".$this->header_height; }
+		
 		// If there are any inactive chains, show how many in the console
 		if($this->stats['chains-inactive'] > 0) {
 			echo "\r\n*** ".$this->stats['chains-inactive']." chains are inactive due to error\r\n";
@@ -459,7 +489,8 @@ class velocity {
 			}
 		}
 		// display if any splintered inputs are pending a block confirmation
-		if($num_splintered = count($this->inputs['splintered']) > 0) {
+		$num_splintered = count($this->inputs['splintered']);
+		if($num_splintered > 0) {
 			echo "\r\n*** $num_splintered large input(s) splintered into ".$this->inputs['splintered-outputs']." outputs this round\r\n";
 			if($this->debug) {
 				// additional debug info
@@ -542,6 +573,14 @@ class velocity {
 			default:
 				return true;
 		}
+	}
+	/**
+	 * get_network_id(): Gets the 'subversion' value of the `getnetworkinfo` RPC command
+	 * 
+	 * return (string): The subversion value returned by the daemon
+	 */
+	function get_network_id() {
+		return $this->daemon->getnetworkinfo()['subversion'];
 	}
 	/**
 	 * get_last_block_time(): Get block time of the current best block
@@ -628,7 +667,7 @@ class velocity {
 	 * 
 	 * return (array): array containing any/all prevtx for our unconfirmed input
 	 */
-	function get_prevtx(array $input, int $index = 0) {
+	function get_prevtx(array $input) {
 		// decode the given input
 		$decoded_input = $this->get_raw_tx($input['txid']);
 		// Set return array
@@ -694,6 +733,14 @@ class velocity {
 		return $ready;
 	}
 	/**
+	 * is_daemon_synced(): Whether or not daemon is fully synced with network
+	 * 
+	 * return (bool): True if daemon is fully synced, false otherwise
+	 */
+	function is_daemon_synced() {
+		return (bool) ($this->height == ($this->header_height = $this->get_header_height()));
+	}
+	/**
 	 * Returns inputs in [{"txid":"abcdef012...","vout":n},{...}] structure
 	 */
 	function get_unspent_inputs() {
@@ -743,7 +790,7 @@ class velocity {
 			$this->tx_craft['send_to_dust'] = true;
 		} else {
 			if($this->debug) echo " NO; getting address from pool...";
-			$address = $this->address_pool[mt_rand(0, count($this->config['max_addr_pool_size']) - 1)];
+			$address = $this->address_pool[mt_rand(0, count($this->address_pool) - 1)];
 			if($this->debug) echo " OK\r\n";
 		}
 		
