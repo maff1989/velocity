@@ -18,7 +18,7 @@ $config['coin']['min_sat_byte'] = 2; // minimum number of satoshis per byte to p
  * 
  *  Inputs larger than max_input_amount will be Splintered into multiple outputs of max_input_amount size
  */
-$config['coin']['max_input_amount'] = 0.001; // max amount of spendable coin required to initialize new chain (default: 0.001)
+$config['coin']['max_input_amount'] = 0.00025; // max amount of spendable coin required to initialize new chain (default: 0.00025)
 $config['coin']['dust_collector'] = 'PUT_UNIQUE_ADDRESS_HERE'; // send all tx amounts less than MIN_TX_AMOUNT (2000 sats default) to this address; CONFIGURE CORRECTLY FOR YOUR COIN
 
 
@@ -51,7 +51,7 @@ class velocity {
 	 */
 	const MIN_TX_AMOUNT = 0.00002000; // min tx spend amount
 	const MAX_ADDR_POOL_SIZE = 1000; // max number of addr to use in extending chains
-	const MIN_TX_AGE = 25; // min 0-conf tx age in seconds required before chain extend attempt
+	const MAX_MEMPOOL_CHAIN = 25; // max number of descendants/links allowed before next height
 	/**
 	 * may implement multiple input/output groups (sway the split percentage) in a future release
 	 */
@@ -61,7 +61,8 @@ class velocity {
 	 * 
 	 */
 	// const VERSION = '0.4.4'; // updated comments/vars/etc + misc code clean-up + fix prevtx
-	const VERSION = '0.4.5'; // dust addr and daemon sync checks added, plus other small fixes
+	// const VERSION = '0.4.5'; // dust addr and daemon sync checks added, plus other small fixes
+	const VERSION = '0.4.6'; // optimized tx_craft structure + small bugfixes
 	
 	
 	/**
@@ -74,7 +75,7 @@ class velocity {
 	private $unspent = []; // 0+ confirmation inputs we can spend
 	private $mempool = []; // mempool info array
 	private $chains = []; // numerical array of tx chains
-	private $inputs = ['splintered' => [], 'splintered-outputs' => 0, 'to_splinter' => []]; // splintered inputs/outputs arrays
+	private $inputs = ['splintered' => [], 'splintered_count' => 0, 'to_splinter' => []]; // splintered inputs/outputs arrays
 	private $stats = [ // runtime stats counters
 		'block' => 0, // current daemon height
 		'blocks-seen' => 0, // blocks seen since start (rounds)
@@ -92,6 +93,14 @@ class velocity {
 	function __construct(array $config) {
 		// Set config
 		$this->config = $config;
+		// set easy debug var for inline conditionals
+		$this->debug = $this->config['core']['debug'];
+		// Get minimum input age required before extending chains
+		$this->config['min_tx_age'] = ($this->config['coin']['avg_block_time'] / self::MAX_MEMPOOL_CHAIN);
+		// Transactions must be this big in size!! otherwise send to dust collector
+		$this->config['min_tx_amount'] = self::MIN_TX_AMOUNT;
+		// Maximum address_pool count; these are used in tx outputs throughout rounds
+		$this->config['max_addr_pool_size'] = self::MAX_ADDR_POOL_SIZE;
 		// Set version number
 		$this->version = self::VERSION;
 		
@@ -104,19 +113,14 @@ class velocity {
 		if(!isset($this->config['coin']['dust_collector']) || $this->config['coin']['dust_collector'] == 'PUT_UNIQUE_ADDRESS_HERE') die("[error] no dust_collector address configured; generating one: ".$this->daemon->getnewaddress()."\r\n*** add this address as the value of the ".'"$config[\'coin\'][\'dust_collector\']"'." variable\r\n");
 		
 		// die if dust address is not valid for daemon; generate dust address
-		if(substr($this->config['coin']['dust_collector'], 0, 1) != substr(array_pop($this->build_address_pool(1)), 0, 1)) die("[error] dust_collector address appears to be for different coin; generating dust address: ".$this->daemon->getnewaddress()."\r\n*** add this address as the value of the ".'"$config[\'coin\'][\'dust_collector\']"'." variable\r\n");
+		if(substr($this->config['coin']['dust_collector'], 0, 1) != substr(array_pop($this->build_address_pool($len = 1)), 0, 1)) die("[error] dust_collector address appears to be for different coin; generating dust address: ".$this->daemon->getnewaddress()."\r\n*** add this address as the value of the ".'"$config[\'coin\'][\'dust_collector\']"'." variable\r\n");
 		
-		// daemon height
+		// Set daemon user agent
+		$this->network_id = $this->get_network_id();
+		// Set daemon height
 		$this->height = $this->daemon->getblockcount();
 		// get latest block time
 		$this->height_time = $this->get_last_block_time();
-		// set easy debug var for inline conditionals
-		$this->debug = $this->config['core']['debug'];
-		
-		// Transactions must be this big in size!! otherwise send to dust collector
-		$this->config['min_tx_amount'] = self::MIN_TX_AMOUNT;
-		// Maximum address_pool count; these are used in tx outputs throughout rounds
-		$this->config['max_addr_pool_size'] = self::MAX_ADDR_POOL_SIZE;
 	}
 	/**
 	 * init(): Primary runtime function; executes the Velocity server
@@ -142,13 +146,11 @@ class velocity {
 			
 			/**
 			 *		NEW BLOCK HANDLER
-			 * 
 			 */
 			$this->update_block_height();
 			
 			/**
 			 *		CONSOLE STATUS UPDATE
-			 * 
 			 */
 			$this->update_console();
 			
@@ -156,32 +158,29 @@ class velocity {
 			sleep(1);
 			
 			// Only proceed if daemon is synced
-			if(!$this->daemon_synced) {
-				$this->stats['blocks-seen'] = 0;
-				continue;
-			}
+			if(!$this->daemon_synced) continue;
 			
-			/**
-			 *		BEGIN INPUTS ITERATION
-			 * 
-			 */
 			// Get all unspent inputs
 			$inputs = $this->get_unspent_inputs();
 			// As long as we have an input to spend...
 			if(!empty($inputs)) {
-				// ... then begin looping through them
+				/**
+				 *		BEGIN INPUTS ITERATION
+				 */
 				for($i = 0; $i < count($inputs); $i++) {
 					// Initialize new tx_craft array
 					$this->tx_craft = [];
 					// Set the current input
 					$this->tx_craft['input'] = $input = $inputs[$i];
 					
-					if($this->debug) echo "[debug] using input:".$input['txid'].':'.$input['vout']."\r\n";
-					
 					// Skip dust collector inputs
 					if($input['address'] == $this->config['coin']['dust_collector']) continue;
 					
-					// Run some conditionals if the input is unconfirmed
+					if($this->debug) echo "[debug] using input: ".$input['txid'].':'.$input['vout']."\r\n";
+					
+					/**
+					 *		CHECK UNCONFIRMED INPUT
+					 */
 					if($this->debug) echo "[debug] checking if input is unconfirmed...";
 					if($this->is_unconfirmed_input($i)) {
 						// Prepare prevtx to spend unconfirmed descendant of unconfirmed parent
@@ -189,7 +188,7 @@ class velocity {
 						$this->tx_craft['prevtxs'] = $prevtx = $this->get_prevtx($this->tx_craft['input']);
 						if($this->debug) echo " OK\r\n";
 						
-						// Check if input is from an unconfirmed, splintered tx
+						// Skip unconfirmed, splintered tx
 						if($this->debug) echo "[debug] checking if input is from a splintered tx...";
 						if(in_array($input['txid'], $this->inputs['splintered'])) {
 							if($this->debug) echo " YES; continuing to next input...\r\n";
@@ -207,11 +206,15 @@ class velocity {
 					 *		CHECK SPLINTER
 					 * 
 					 * We must craft a special transaction for Splinter. We divide input amount by
+					 * 
 					 * $this->config['coin']['max_input_amount']
+					 * 
 					 * to create
-					 * (X < $this->config['core']['max_splinter_count'])
+					 * 
+					 * (X <= $this->config['core']['max_splinter_count'])
+					 * 
 					 * number of outputs in a single tx. Then we set the txid of the newly-created
-					 * inputs in the splintered[] array and await a new round before chaining the inputs
+					 * inputs in the splintered[] array and await a new round before chaining them
 					 */
 					if(
 						$this->tx_craft['spendable'] > $this->config['coin']['max_input_amount']
@@ -219,45 +222,30 @@ class velocity {
 						// Don't splinter an input if it is waiting for the next block
 						!in_array($this->tx_craft['input']['txid'].':'.$this->tx_craft['input']['vout'], $this->inputs['to_splinter'])
 					) {
-						// Round up to nearest whole number.. last output receives remaining amount
-						$num_outputs = floor($this->tx_craft['spendable'] / $this->config['coin']['max_input_amount']);
-						// Only proceed with splinter if above calculation results in more than 2 outputs
-						if($num_outputs > 1) {
+						// Round down to nearest whole number.. last output receives remaining amount
+						$this->tx_craft['num_outputs'] = floor($this->tx_craft['spendable'] / $this->config['coin']['max_input_amount']);
+						// Only proceed with splinter if above calculation results in more than 1 output
+						if($this->tx_craft['num_outputs'] > 1) {
 							// Ensure only the max_splinter_count number of outputs, otherwise tx craft could fail
-							if($num_outputs > $this->config['core']['max_splinter_count']) $num_outputs = $this->config['core']['max_splinter_count'];
+							if($this->tx_craft['num_outputs'] > $this->config['core']['max_splinter_count']) $this->tx_craft['num_outputs'] = $this->config['core']['max_splinter_count'];
 							
-							echo "\r\n*** large input detected (".$this->tx_craft['spendable']."); splintering into $num_outputs outputs...\r\n*** ";
-							// Get output address pool
-							$addresses = $this->build_address_pool($num_outputs);
-							for($j = 0; $j < $num_outputs; $j++) {
-								$amount = (
-									$j == ($num_outputs - 1) ?
-										(float) $this->tx_craft['spendable'] - number_format($this->config['coin']['max_input_amount'] * ($num_outputs - 1), 8):
-										$this->config['coin']['max_input_amount']
-								);
-								$this->tx_craft['outputs'][$addresses[$j]] = $amount;
-								echo ".";
-							}
-							echo "\r\n";
-							
-							// Craft, sign, then readjust for fee and sign again
-							$this->tx_craft_rawtx();
-							$this->tx_craft_signrawtx();
-							$this->tx_craft_adjustsignrawtx();
+							// SPLINTER!
+							echo "\r\n*** large input detected (".$this->tx_craft['spendable'].")";
+							$this->run_tx_craft([
+								'splinter',
+								'rawtx',
+								'signrawtx',
+								'adjustsignrawtx'
+							]);
 							
 							// SPEND! :)
 							$txid = $this->tx_craft_spend($ignore_chain = true);
 							if($txid) {
-								/*
-								// After sending the tx, set each txid:vout in the inactive inputs array
-								for($j = 0; $j < count($this->tx_craft['outputs']); $j++) {
-									$this->inputs['splintered'][] = "$txid:$j";
-								}
-								*/
-								// the new txid references all of the children of the used input, so add
-								// the new txid to the splintered array and await tx confirmation before spending
+								// the new txid references all new inputs of splintered utxo
+								// this tx now must wait for confirmation before all utxos can be spent
 								$this->inputs['splintered'][] = $txid;
-								$this->inputs['splintered-outputs'] += $num_outputs;
+								// Number of total splintered outputs this round
+								$this->inputs['splintered_count'] += $this->tx_craft['num_outputs'];
 								
 								
 							} else {
@@ -269,7 +257,7 @@ class velocity {
 							// Check if new block height after each chain link is created; new blocks take precedence
 							if($this->update_block_height()) continue 2;
 							
-							// Update console and wait a bit or two before continuing
+							// Update console and wait a bit or two before continuing to next input
 							$this->update_console();
 							$this->rand_wait();
 							continue;
@@ -317,26 +305,13 @@ class velocity {
 						 *		TRANSACTION CRAFTING
 						 * 
 						 */
-						$steps = [
+						// Execute tx_craft functions to get an adjusted, signed tx
+						$this->run_tx_craft([
 							'getoutputs',
 							'rawtx',
 							'signrawtx',
 							'adjustsignrawtx'
-						];
-						
-						// Once the tx is crafted, we exit the below while() loop to spend the tx
-						$tx_crafted = false;
-						$step = current($steps);
-						while($tx_crafted === false) {
-							// set and run the current function
-							$function = 'tx_craft_'.$step;
-							$this->$function();
-							
-							// If last step, tx is crafted
-							// otherwise proceed to next step
-							if($step == $steps[count($steps) - 1]) $tx_crafted = true;
-							else $step = next($steps);
-						}
+						]);
 						
 						/**
 						 *		SPEND THE CRAFTED TX :)
@@ -349,7 +324,7 @@ class velocity {
 						// Check if new block height after each chain link is created; new blocks take precedence
 						if($this->update_block_height()) continue 2;
 						
-						// Update console and wait a bit or two before continuing
+						// Update console and wait a bit or two before continuing to next input
 						$this->update_console();
 						$this->rand_wait();
 						continue;
@@ -374,7 +349,6 @@ class velocity {
 	}
 	/**
 	 * update_runtime_stats(): Update counters for all available console stats
-	 * 
 	 */
 	function update_runtime_stats() {
 		// Update the mempool info
@@ -393,7 +367,7 @@ class velocity {
 	/**
 	 * get_header_height(): Check with daemon for block header height (i.e. total blocks on network)
 	 * 
-	 * return (int): Number of block headers downloaded from peers
+	 * return (int): Number of total blockchain headers downloaded from peers
 	 */
 	function get_header_height() {
 		return $this->daemon->getblockchaininfo()['headers'];
@@ -404,19 +378,12 @@ class velocity {
 	 * return (bool): True if new height, false otherwise
 	 */
 	function update_block_height() {
-		
 		// Update block height
-		$this->prev_height = $this->height;
-		$this->height = $this->daemon->getblockcount();
+		$new_height = $this->daemon->getblockcount();
 		// If new block found...
-		if($this->height > $this->prev_height) {
-			// Set current time of block height
-			$this->height_time = $this->get_last_block_time();
+		if($new_height > $this->height) {
 			// Start the next round
-			$this->next_round();
-			// block height updated
-			return true;
-			
+			return $this->next_round($new_height);
 		}
 		// no block height update
 		return false;
@@ -424,18 +391,41 @@ class velocity {
 	/**
 	 * next_round(): Update some stats and reset some arrays for the next round
 	 */
-	function next_round() {
+	function next_round($new_height) {
+		/**
+		 *		BLOCKCHAIN
+		 */
+		// Set the new height
+		$this->height = $new_height;
+		// Set current time of block height
+		$this->height_time = $this->get_last_block_time();
+		
+		/**
+		 *		STATS
+		 */
 		// Increment blocks seen stat (on to the next, on, on to the next one)
 		$this->stats['blocks-seen'] += 1;
 		// Add total links created during last round to confirmed count
 		$this->stats['links-confirmed'] += $this->stats['links'];
+		
+		/**
+		 *		CHAINS
+		 */
 		// Reset all chains after new block; start with fresh tx chains
 		$this->chains = [];
 		
+		/**
+		 *		SPLINTER
+		 */
 		// Reset the inactive and disabled inputs since new block means they are ready to chain
-		$this->inputs['splintered'] = [];
-		$this->inputs['splintered-outputs'] = 0;
-		$this->inputs['to_splinter'] = [];
+		$this->inputs = ['to_splinter' => [], 'splintered' => [], 'splintered_count' => 0];
+		
+		/**
+		 *		MISC
+		 */
+		// might add more here in the future
+		
+		return true;
 	}
 	/**
 	 * update_console(): Display all relevant statistical and runtime information to the console
@@ -447,7 +437,7 @@ class velocity {
 		system('clear');
 		echo "\r\n";
 		echo "\tVelocity, for cryptocurrencies (v".$this->version.")\r\n";
-		echo "\trunning \"".$this->get_network_id()."\" since ".date('m/d/Y H:i:s', $this->start_time)."\r\n";
+		echo "\trunning \"".$this->network_id."\" since ".date('m/d/Y H:i:s', $this->start_time)."\r\n";
 		echo "\r\n";
 		echo "\tdust collector: ".$this->config['coin']['dust_collector']."\r\n";
 		echo "\r\n";
@@ -491,7 +481,7 @@ class velocity {
 		// display if any splintered inputs are pending a block confirmation
 		$num_splintered = count($this->inputs['splintered']);
 		if($num_splintered > 0) {
-			echo "\r\n*** $num_splintered large input(s) splintered into ".$this->inputs['splintered-outputs']." outputs this round\r\n";
+			echo "\r\n*** $num_splintered large input(s) splintered into ".$this->inputs['splintered_count']." outputs this round\r\n";
 			if($this->debug) {
 				// additional debug info
 			}
@@ -519,7 +509,7 @@ class velocity {
 			'tip' => [
 				'txid' => $input['txid'],
 				'vout' => $input['vout'],
-				'time' => time() - (self::MIN_TX_AGE + 1),
+				'time' => time() - ($this->config['min_tx_age'] + 1),
 				'genesis' => true
 			],
 			'links' => [],
@@ -575,9 +565,9 @@ class velocity {
 		}
 	}
 	/**
-	 * get_network_id(): Gets the 'subversion' value of the `getnetworkinfo` RPC command
+	 * get_network_id(): Gets the user agent of the current daemon
 	 * 
-	 * return (string): The subversion value returned by the daemon
+	 * return (string): the user agent
 	 */
 	function get_network_id() {
 		return $this->daemon->getnetworkinfo()['subversion'];
@@ -588,8 +578,7 @@ class velocity {
 	 * return (int): the block's epoch time
 	 */
 	function get_last_block_time() {
-		$block = $this->daemon->getblock($this->daemon->getbestblockhash());
-		return $block['time'];
+		return $this->daemon->getblock($this->daemon->getbestblockhash())['time'];
 	}
 	/**
 	 * get_block_time_indicator(): Sets the console indicator as to whether block height is new or old
@@ -694,7 +683,6 @@ class velocity {
 	 * @param (array) $input: Array containing the txid and vout of the specific input
 	 * 
 	 * return (int): Index of chain in which input exists, false otherwise
-	 * 
 	 */
 	function is_chained_input(array $input) {
 		// For each chain
@@ -728,7 +716,7 @@ class velocity {
 	function is_input_ready(array $chain_tip) {
 		
 		// Input is ready if it is of the minimum age for newly-created inputs
-		$ready = (bool) (time() > ($chain_tip['time'] + self::MIN_TX_AGE));
+		$ready = (bool) (time() > ($chain_tip['time'] + $this->config['min_tx_age']));
 		
 		return $ready;
 	}
@@ -773,11 +761,30 @@ class velocity {
 		return $this->daemon->decoderawtransaction($this->daemon->getrawtransaction($txid));
 	}
 	/**
-	 *		TX CRAFTING FUNCTIONS
+	 *		
+	 * 
+	 * 
+	 *				TX_CRAFT FUNCTIONS
 	 * 
 	 * 
 	 * 
 	 */
+	function run_tx_craft(array $steps) {
+		
+		$tx_crafted = false;
+		$step = current($steps);
+		while($tx_crafted === false) {
+			// set and run the current function
+			$function = 'tx_craft_'.$step;
+			$this->$function();
+			
+			// If last step, set tx as crafted
+			// otherwise proceed to next step
+			if($step == $steps[count($steps) - 1]) $tx_crafted = true;
+			else $step = next($steps);
+		}
+	}
+	
 	function tx_craft_getoutputs() {
 	
 		// Set up outputs to distribute coin(s)
@@ -803,6 +810,23 @@ class velocity {
 			if($this->debug) echo " OK\r\n";
 		}
 		
+	}
+	
+	function tx_craft_splinter() {
+		echo "\r\n*** splintering into ".$this->tx_craft['num_outputs']." outputs...";
+		echo "\r\n*** ";
+		// Get output address pool
+		$addresses = $this->build_address_pool($this->tx_craft['num_outputs']);
+		for($j = 0; $j < $this->tx_craft['num_outputs']; $j++) {
+			$amount = (
+				$j == ($this->tx_craft['num_outputs'] - 1) ?
+					(float) $this->tx_craft['spendable'] - number_format($this->config['coin']['max_input_amount'] * ($this->tx_craft['num_outputs'] - 1), 8):
+					$this->config['coin']['max_input_amount']
+			);
+			$this->tx_craft['outputs'][$addresses[$j]] = $amount;
+			echo ".";
+		}
+		echo "\r\n";
 	}
 	
 	function tx_craft_rawtx() {
@@ -893,8 +917,16 @@ class velocity {
 		return $txid;
 		
 	}
-	
-	function adjust_for_fee($signed_tx, array $inputs, array $outputs) {
+	/**
+	 * adjust_for_fee(): Restructs and resigns new tx_craft to adjust fee to (tx_size * min_sat_byte)
+	 * 
+	 * @param (array) $signed_tx: array containing hex of initial signed tx
+	 * @param (array) $inputs: the inputs used in this transaction
+	 * @param (array) $outputs: recipient(s) of the input amount
+	 * 
+	 * return (array): newly created raw_tx, die on failure
+	 */
+	function adjust_for_fee(array $signed_tx, array $inputs, array $outputs) {
 		$decoded_tx = $this->daemon->decoderawtransaction($signed_tx['hex']);
 		
 		// loop through vouts backwards to adjust last eligible output
@@ -914,9 +946,15 @@ class velocity {
 			}
 		}
 		
-		// If we haven't yet returned, assume we cannot pay for the tx
+		// If we have yet to return, then we cannot adjust for fee
 		return false;
 		
+	}
+	/**
+	 * rand_wait(): Block loop iterations for a random amount of time
+	 */
+	function rand_wait() {
+		usleep(mt_rand(65000,115000));
 	}
 	
 	/*
@@ -941,12 +979,6 @@ class velocity {
 		
 	}
 	*/
-	/**
-	 * rand_wait(): Block loop iterations for a random amount of time
-	 */
-	function rand_wait() {
-		usleep(mt_rand(65000,115000));
-	}
 	
 }
 
