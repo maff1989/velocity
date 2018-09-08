@@ -7,7 +7,7 @@ spend cryptocurrency inputs in chains to simulate cash velocity
 **THIS TOOL DOES NOT WORK WITH ETHEREUM; ONLY BITCOIN DERIVATIVES SUCH AS BITCOIN CASH, LITECOIN, DASH, ZCASH, DIGIBYTE, SMARTCASH, ZCOIN, ETC. (i.e. anything forked from a recent Bitcoin Core codebase supported by [EasyBitcoin-PHP][1]). ENDEAVORS TO RUN THIS SCRIPT AS-IS ON ETH/ETC/ELLA/ETC. NETWORKS WILL LIKELY END IN DISASTER**
 
 ## Elevator Pitch
-Velocity is a PHP script written as a tool to test the resiliency of cryptocurrency networks under heavy transaction loads. It connects via RPC to the daemon of choice to gather and spend each unspent input to a single, new address, thereby creating the first *link* in a transaction *chain*. Each chain is extended with new links as the program continues operation. Inputs are never merged, or spent together; each chain remains independent from one another as links are added to them. Chains are discarded as new blocks are found; each new block starts a new round where new chains are built from links of fresh, confirmed inputs.
+Velocity is a PHP script written as a tool to test the resiliency of cryptocurrency networks under heavy transaction loads. It connects via RPC to the daemon of choice to gather and spend each unspent input individually to a single address, thereby creating the first *link* in a transaction *chain*. Each chain is extended with new links as the program continues operation. Inputs are never merged, or spent together; each chain remains independent from one another as links are added to them. Chains are discarded as new blocks are found; each new block starts a new round where new chains are built from fresh, confirmed inputs.
 
 ## Features
 * **Fully automated** - Velocity keeps a connection to the coin daemon and internally keeps track of all chains created, handles all states, and sends all money until it can no longer do so, then it dumps the remaining balance into the configured dust collector address
@@ -15,7 +15,7 @@ Velocity is a PHP script written as a tool to test the resiliency of cryptocurre
 * **Widely compatible** - Velocity will work with any Bitcoin Core full-node derivative that supports these common JSON-RPC calls: `createrawtransaction`, `signrawtransaction`, `getrawtransaction`, `decoderawtransaction`, `sendrawtransaction`, `getnewaddress`, `getblockcount`, `getmempoolinfo`, `getaddressesbyaccount`, `getbestblockhash`, and `listunspent`
 
 ## Setup
-1. As of v0.4.4, Velocity requires an RPC connection to a *fully-validating daemon* (with a `host:port`) to function. This may change in the future as the project matures. Refer to the developer's website of any particular coin if you wish to run their fully-validating daemon with Velocity.
+1. As of v0.1, Velocity requires an RPC connection to a *fully-validating daemon* (with a `host:port`) to function. This may change in the future as the project matures. Refer to the developer's website of any particular coin if you wish to run their fully-validating daemon with Velocity.
 2. Once you finish setting up the daemon, be sure that you allow the daemon to fully synchronize with the blockchain. Transactions crafted by Velocity will be rejected by the daemon if it knows that it is not fully sync'd with the network. Some daemons take days to sync depending on the hardware you are using; please be patient.
 3. Also be sure that the RPC configuration you created for your daemon is reflected in your copy of the `velocity` script. Please only edit the `$config` options near the top.
 3. The script was written and tested in `PHP 7.0.30` on the `Ubuntu 16.04.5` operating system. *Theoretically*, the PHP script will work on Windows. I do not plan on providing support for the Windows platform, so if any functions do not work on Windows, feel free to make a pull request. :)
@@ -24,7 +24,9 @@ Velocity is a PHP script written as a tool to test the resiliency of cryptocurre
 ## Running velocity
 I recommend a `132x24` terminal window size for running Velocity.
 
-Assuming all above is already completed, and you are at a terminal in the directory in which you've downloaded and modified the `velocity` script per your configuration, you are ready run Velocity.
+I recommend running the fully-validating daemon in the background, not in its graphical QT form; QT will tremendously reduce transaction throughput!
+
+Assuming all above is already completed, your fully-validating daemon is running, and you are at a terminal in the directory in which you've downloaded and modified the `velocity` script per your configuration, you are ready run Velocity.
 
 In your terminal, run the following command: `./velocity`
 
@@ -36,14 +38,14 @@ Velocity will immediately begin polling your coin daemon via RPC to check for un
 * If for any reason the daemon connection fails, you will see an `[error]` stating so and the reason why. Please verify your Velocity and crypto daemon config and try again.
 * If the connection is successful, the following is an example of what you will see:
 
-```
-  	Velocity, for cryptocurrencies (v0.4.4)
-	running since 09/03/2018 00:37:33
+```	
+	Velocity, for cryptocurrencies (v0.4.6)
+	running "/BUCash:1.4.0(EB32; AD12)/" since 09/08/2018 08:44:43
 
-	Dust collector:115EJnyiwLqCTfDfMdhsbPBUgT54AtMqRw
+	dust collector: 16pfpPgmZn9Ah6dNFLC2AW7h1r9kU3PGiu
 
-[main] round 6: { block:546224  chains:2  links:16  links-confirmed:86 }
-[main] mempool: { tx-count:13180  total-size:2,687,153 bytes  ram:12,345,376 bytes }
+[main] round 1: { block:546976  chains:0  links:0  links-confirmed:0 }
+[main] mempool: { tx-count:24  total-size:7,537 bytes  ram:26,080 bytes }
 
 ```
 
